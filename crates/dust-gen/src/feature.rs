@@ -234,6 +234,16 @@ struct Placed {
     /// `None` when this generator does not run it.
     chain: Option<Vec<Modifier>>,
     ore: Option<Ore>,
+    /// Whether every biome of the pack names this feature, in which case the
+    /// biome filter cannot refuse a position and is not asked.
+    ///
+    /// Not an approximation: `BiomeFilter` asks whether the biome at the
+    /// position lists the feature, and if all of them do then so does that one.
+    /// It is worth having because the lookup is a climate evaluation and a
+    /// search over seven thousand parameter regions, and twenty-six of the
+    /// thirty ores a vanilla overworld runs are named by all fifty-three
+    /// biomes.
+    everywhere: bool,
 }
 
 /// What one chunk's feature stage did, counted rather than assumed.
@@ -423,6 +433,11 @@ impl Features {
         }
 
         let words = placed.len().div_ceil(64);
+        for (index, entry) in placed.iter_mut().enumerate() {
+            entry.everywhere = biome_chains
+                .iter()
+                .all(|named| named.binary_search(&(index as u32)).is_ok());
+        }
         let mut biome_sets = Vec::with_capacity(biome_chains.len());
         for named in &biome_chains {
             let mut set = vec![0u64; words].into_boxed_slice();
@@ -705,6 +720,7 @@ fn read_placed(
         kind,
         chain,
         ore,
+        everywhere: false,
     })
 }
 
@@ -1233,7 +1249,9 @@ fn run(
             );
         }
         Modifier::Biome => {
-            if features.names_here(site, position, biomes) {
+            if features.placed[site.which as usize].everywhere
+                || features.names_here(site, position, biomes)
+            {
                 run(
                     features, rng, nodes, mask, counts, chain, depth + 1, position, ore, site,
                     biomes,
@@ -1573,5 +1591,711 @@ impl Features {
     #[cfg(test)]
     fn floors(&self, code: u8) -> bool {
         self.ocean_floor.contains(code)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::noise::build::NoiseSettings;
+    use crate::noise::rng::{Legacy, Xoroshiro};
+
+    /// A data pack on disk, written by the test. Nothing of Mojang's is needed
+    /// to check that the sorter sorts or that a vein lands where it lands.
+    struct Pack {
+        dir: PathBuf,
+    }
+
+    impl Pack {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("dust-gen-feature-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self { dir }
+        }
+
+        fn write(&self, relative: &str, text: &str) {
+            let path = self.dir.join(relative);
+            std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write");
+        }
+
+        /// A biome naming `steps[i]` at decoration step `i`.
+        fn biome(&self, name: &str, steps: &[&[&str]]) {
+            let body: Vec<String> = steps
+                .iter()
+                .map(|list| {
+                    let quoted: Vec<String> =
+                        list.iter().map(|entry| format!("\"{entry}\"")).collect();
+                    format!("[{}]", quoted.join(", "))
+                })
+                .collect();
+            self.write(
+                &format!("minecraft/worldgen/biome/{name}.json"),
+                &format!(r#"{{"features": [{}]}}"#, body.join(", ")),
+            );
+        }
+
+        /// A placed ore, counted `count` times over `min..=max`.
+        #[allow(clippy::too_many_arguments)]
+        fn ore(
+            &self,
+            name: &str,
+            count: i32,
+            min: i32,
+            max: i32,
+            size: i32,
+            block: &str,
+            tag: &str,
+            biome_filter: bool,
+        ) {
+            let filter = if biome_filter {
+                r#", {"type": "minecraft:biome"}"#
+            } else {
+                ""
+            };
+            self.write(
+                &format!("minecraft/worldgen/placed_feature/{name}.json"),
+                &format!(
+                    r#"{{"feature": "minecraft:{name}", "placement": [
+                        {{"type": "minecraft:count", "count": {count}}},
+                        {{"type": "minecraft:in_square"}},
+                        {{"type": "minecraft:height_range", "height": {{
+                            "type": "minecraft:uniform",
+                            "min_inclusive": {{"absolute": {min}}},
+                            "max_inclusive": {{"absolute": {max}}}}}}}{filter}]}}"#
+                ),
+            );
+            self.write(
+                &format!("minecraft/worldgen/configured_feature/{name}.json"),
+                &format!(
+                    r#"{{"type": "minecraft:ore", "config": {{
+                        "discard_chance_on_air_exposure": 0.0,
+                        "size": {size},
+                        "targets": [{{"state": {{"Name": "{block}"}},
+                                      "target": {{"predicate_type": "minecraft:tag_match",
+                                                  "tag": "{tag}"}}}}]}}}}"#
+                ),
+            );
+        }
+
+        /// A feature of a type this generator does not run.
+        fn other(&self, name: &str, kind: &str) {
+            self.write(
+                &format!("minecraft/worldgen/placed_feature/{name}.json"),
+                &format!(
+                    r#"{{"feature": "minecraft:{name}", "placement": [
+                        {{"type": "minecraft:in_square"}}, {{"type": "minecraft:biome"}}]}}"#
+                ),
+            );
+            self.write(
+                &format!("minecraft/worldgen/configured_feature/{name}.json"),
+                &format!(r#"{{"type": "{kind}", "config": {{}}}}"#),
+            );
+        }
+
+        fn tag(&self, name: &str, members: &[&str]) {
+            let quoted: Vec<String> = members.iter().map(|m| format!("\"{m}\"")).collect();
+            self.write(
+                &format!("minecraft/tags/block/{name}.json"),
+                &format!(r#"{{"values": [{}]}}"#, quoted.join(", ")),
+            );
+        }
+    }
+
+    /// An evaluator over nothing, for the checks whose features are named by
+    /// every biome of their pack and therefore never ask which biome it is.
+    fn nowhere() -> (crate::noise::density::Graph, crate::biome::BiomeParameters) {
+        let header = [
+            "# biome_id",
+            "biome",
+            "temperature_min",
+            "temperature_max",
+            "humidity_min",
+            "humidity_max",
+            "continentalness_min",
+            "continentalness_max",
+            "erosion_min",
+            "erosion_max",
+            "depth_min",
+            "depth_max",
+            "weirdness_min",
+            "weirdness_max",
+            "offset",
+        ]
+        .join("\t");
+        let row = [
+            "0",
+            "minecraft:plains",
+            "-10000",
+            "10000",
+            "-10000",
+            "10000",
+            "-10000",
+            "10000",
+            "-10000",
+            "10000",
+            "-10000",
+            "10000",
+            "-10000",
+            "10000",
+            "0",
+        ]
+        .join("\t");
+        let table = format!("{header}\n{row}");
+        (
+            crate::noise::density::Graph::default(),
+            crate::biome::BiomeParameters::parse(&table).expect("the table parses"),
+        )
+    }
+
+    fn settings() -> NoiseSettings {
+        NoiseSettings {
+            cell_width: 4,
+            cell_height: 8,
+            min_y: -64,
+            height: 384,
+            sea_level: 63,
+            default_block: BlockSpec {
+                name: "minecraft:stone".to_owned(),
+                properties: Vec::new(),
+            },
+            default_fluid: BlockSpec {
+                name: "minecraft:water".to_owned(),
+                properties: Vec::new(),
+            },
+            aquifers_enabled: false,
+        }
+    }
+
+    /// A pack with one biome, one ore, and the tag it replaces.
+    fn one_ore(name: &str, count: i32, size: i32) -> (Pack, Vec<String>) {
+        let pack = Pack::new(name);
+        pack.tag("stone_ore_replaceables", &["minecraft:stone"]);
+        pack.ore(
+            "ore_coal",
+            count,
+            -60,
+            60,
+            size,
+            "minecraft:coal_ore",
+            "minecraft:stone_ore_replaceables",
+            true,
+        );
+        pack.biome("plains", &[&[], &[], &[], &[], &[], &[], &["minecraft:ore_coal"]]);
+        (pack, vec!["minecraft:plains".to_owned()])
+    }
+
+    fn compiled(pack: &Pack, biomes: &[String]) -> Features {
+        let mut features = Features::over(&pack.dir, &settings(), 42, biomes, &[])
+            .expect("the pack compiles")
+            .expect("the pack names a feature this generator runs");
+        // Every block of the palette blocks motion here; the point of the
+        // binding is that the caller answers, not what the answer is.
+        let unbound = features.bind_ocean_floor(&[], |_| Some(true));
+        assert!(unbound.is_empty(), "{unbound:?}");
+        let bound = features.bind_biomes(|name| {
+            biomes
+                .iter()
+                .position(|entry| entry == name)
+                .map(|slot| slot as u32)
+        });
+        assert!(bound.is_empty(), "{bound:?}");
+        features
+    }
+
+    /// A chunk of solid default block, and the heights that go with it.
+    fn solid_chunk() -> (Vec<u8>, Vec<i16>) {
+        (vec![1u8; 384 * 256], vec![320i16; WINDOW * WINDOW])
+    }
+
+    // ---------------------------------------------------------------- streams
+
+    /// The stream a feature draws from is `java.util.Random`'s arithmetic over
+    /// xoroshiro's bits, and **is neither of the two generators this crate
+    /// already had**. Both wrong answers are plausible and both produce a
+    /// world; only a check that requires the three to *disagree* can tell them
+    /// apart.
+    #[test]
+    fn the_feature_stream_is_neither_of_the_two_it_is_made_of() {
+        let seed = 987_654_321i64;
+        let mut worldgen = Worldgen::new();
+        worldgen.set_seed(seed);
+        let mut xoroshiro = Xoroshiro::from_seed(seed);
+        let mut legacy = Legacy::from_seed(seed);
+
+        // `nextInt(3)` is not a power of two, so the wrapper runs Java's
+        // rejection loop over `next(31)` while a bare xoroshiro runs Lemire's
+        // multiply-shift. Over twenty draws they cannot agree by accident.
+        let mine: Vec<i32> = (0..20).map(|_| worldgen.next_i32_below(3)).collect();
+        let theirs: Vec<i32> = (0..20).map(|_| xoroshiro.next_i32_below(3)).collect();
+        let legacy_draws: Vec<i32> = (0..20).map(|_| legacy.next_i32_below(3)).collect();
+        assert_ne!(mine, theirs, "the wrapper is not a bare xoroshiro source");
+        assert_ne!(mine, legacy_draws, "the wrapper is not the legacy LCG");
+        assert!(
+            mine.iter().all(|&value| (0..3).contains(&value)),
+            "and it is still in range: {mine:?}"
+        );
+    }
+
+    /// `nextDouble` is **two** draws in `java.util.Random` and one in
+    /// xoroshiro's own source. A version that took one would agree about the
+    /// first vein node of every ore and disagree about the second.
+    #[test]
+    fn a_double_costs_two_draws_and_a_float_costs_one() {
+        let seed = 5_150i64;
+        let mut two = Worldgen::new();
+        two.set_seed(seed);
+        let _ = two.next_f64();
+        let after_double = two.next_f32();
+
+        let mut one = Worldgen::new();
+        one.set_seed(seed);
+        let _ = one.next_f32();
+        let after_float = one.next_f32();
+        assert_ne!(
+            after_double, after_float,
+            "a double and a float cannot cost the same number of draws"
+        );
+
+        // And the value itself is in range, so the check is not passing on two
+        // kinds of nonsense.
+        let mut third = Worldgen::new();
+        third.set_seed(seed);
+        let value = third.next_f64();
+        assert!((0.0..1.0).contains(&value), "{value}");
+    }
+
+    /// `setDecorationSeed` throws away two `nextLong` draws taken from the
+    /// *seeded* stream, and those are four xoroshiro outputs because the
+    /// wrapper's `nextLong` is two 32-bit halves. Reading it as "hash the
+    /// coordinates" gives every world the same features somewhere else.
+    #[test]
+    fn a_decoration_seed_is_four_draws_deep() {
+        let seed = -12_345i64;
+        let mut rng = Worldgen::new();
+        let decoration = rng.set_decoration_seed(seed, 160, -320);
+
+        // The same arithmetic over xoroshiro's *own* `nextLong`, which is one
+        // draw and not two. It must disagree.
+        let mut raw = Xoroshiro::from_seed(seed);
+        let a = raw.next_u64() as i64 | 1;
+        let b = raw.next_u64() as i64 | 1;
+        let naive = (160i64.wrapping_mul(a)).wrapping_add((-320i64).wrapping_mul(b)) ^ seed;
+        assert_ne!(
+            decoration, naive,
+            "the wrapper's nextLong is two 32-bit halves, not one 64-bit draw"
+        );
+
+        // And the two coordinates both reach it.
+        let mut other = Worldgen::new();
+        assert_ne!(decoration, other.set_decoration_seed(seed, 160, -304));
+    }
+
+    /// `setFeatureSeed` re-seeds per feature, which is why skipping a feature
+    /// this generator does not run changes nothing for the ones it does.
+    #[test]
+    fn a_feature_seed_depends_on_its_index_and_its_step() {
+        let mut rng = Worldgen::new();
+        let decoration = rng.set_decoration_seed(1, 0, 0);
+        let mut first = Worldgen::new();
+        first.set_feature_seed(decoration, 3, 6);
+        let a = first.next_f32();
+        // Index and step are added with different weights, so the pair (13, 6)
+        // and (3, 7) -- which differ by 10,000 and 10 -- are different streams.
+        let mut second = Worldgen::new();
+        second.set_feature_seed(decoration, 13, 6);
+        assert_ne!(a, second.next_f32());
+        let mut third = Worldgen::new();
+        third.set_feature_seed(decoration, 3, 7);
+        assert_ne!(a, third.next_f32());
+        // And the same pair is the same stream, twice.
+        let mut again = Worldgen::new();
+        again.set_feature_seed(decoration, 3, 6);
+        assert_eq!(a, again.next_f32());
+    }
+
+    // ------------------------------------------------------------- placement
+
+    /// `UniformHeight` on a one-block range still draws, and `TrapezoidHeight`
+    /// draws twice. `Mth.randomBetweenInclusive` has no `min >= max` early-out
+    /// and `Mth.nextInt` does; taking the wrong one loses a draw and every
+    /// feature after it in the chain moves.
+    #[test]
+    fn a_height_provider_draws_even_when_it_cannot_choose() {
+        let mut rng = Worldgen::new();
+        rng.set_seed(7);
+        let flat = Height::Uniform { min: 5, max: 5 };
+        assert_eq!(flat.sample(&mut rng), 5);
+        let after_uniform = rng.next_f32();
+
+        let mut fresh = Worldgen::new();
+        fresh.set_seed(7);
+        let after_nothing = fresh.next_f32();
+        assert_ne!(
+            after_uniform, after_nothing,
+            "a one-block uniform range still costs a draw"
+        );
+
+        let mut two = Worldgen::new();
+        two.set_seed(7);
+        let trapezoid = Height::Trapezoid {
+            min: -24,
+            max: 56,
+            plateau: 0,
+        };
+        let y = trapezoid.sample(&mut two);
+        assert!((-24..=56).contains(&y), "{y}");
+        let mut once = Worldgen::new();
+        once.set_seed(7);
+        let _ = once.between_inclusive(-24, 56);
+        assert_ne!(
+            two.next_f32(),
+            once.next_f32(),
+            "a trapezoid is two draws and a uniform is one"
+        );
+    }
+
+    /// A trapezoid over an odd range has unequal halves, because Java's integer
+    /// division truncates. A tidy symmetric sampler would agree about the mean
+    /// and disagree about the value.
+    #[test]
+    fn a_trapezoid_over_an_odd_range_is_not_symmetric() {
+        let low = Height::Trapezoid {
+            min: 0,
+            max: 5,
+            plateau: 0,
+        };
+        // range 5 -> low half 2, high half 3. Every sample is
+        // `nextInt(4) + nextInt(3)`, so the reachable set is 0..=5 and the
+        // distribution is skewed towards the high half.
+        let mut counts = [0u32; 6];
+        for seed in 0..4000i64 {
+            let mut rng = Worldgen::new();
+            rng.set_seed(seed);
+            counts[low.sample(&mut rng) as usize] += 1;
+        }
+        assert!(counts.iter().all(|&n| n > 0), "{counts:?}");
+        assert_ne!(
+            counts[2], counts[3],
+            "an odd range cannot have a symmetric mode: {counts:?}"
+        );
+        assert!(
+            counts[3] > counts[0] && counts[2] > counts[5],
+            "and the middle is still the fat part: {counts:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------- sorting
+
+    /// `FeatureSorter` is a reverse-post-order depth-first topological sort
+    /// over `(step, first-appearance index)`, and the position it gives a
+    /// feature is what that feature's whole stream is seeded from.
+    ///
+    /// The fixture is built so that **first-appearance order is not the
+    /// answer**: the second biome names `c` before `a`, which forces `c` ahead
+    /// of `a` even though `a` was numbered first.
+    #[test]
+    fn the_sorter_is_a_topological_order_and_not_a_sort_by_index() {
+        let pack = Pack::new("sorter");
+        pack.tag("stone_ore_replaceables", &["minecraft:stone"]);
+        for (name, block) in [
+            ("ore_a", "minecraft:coal_ore"),
+            ("ore_b", "minecraft:iron_ore"),
+            ("ore_c", "minecraft:gold_ore"),
+        ] {
+            pack.ore(
+                name,
+                1,
+                -60,
+                60,
+                4,
+                block,
+                "minecraft:stone_ore_replaceables",
+                true,
+            );
+        }
+        let step = |list: &[&str]| -> Vec<Vec<String>> { vec![list.iter().map(|s| (*s).to_owned()).collect()] };
+        let _ = step;
+        pack.biome(
+            "first",
+            &[&[], &[], &[], &[], &[], &[], &["minecraft:ore_a", "minecraft:ore_b"]],
+        );
+        pack.biome(
+            "second",
+            &[&[], &[], &[], &[], &[], &[], &["minecraft:ore_c", "minecraft:ore_a"]],
+        );
+        let biomes = vec!["minecraft:first".to_owned(), "minecraft:second".to_owned()];
+        let features = compiled(&pack, &biomes);
+        let order: Vec<&str> = features.steps[6]
+            .iter()
+            .map(|&which| features.placed[which as usize].name.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["minecraft:ore_c", "minecraft:ore_a", "minecraft:ore_b"],
+            "c before a because the second biome says so, even though a was numbered first"
+        );
+    }
+
+    // --------------------------------------------------------------- the ore
+
+    /// A vein's radius comes from `Mth.sin`, a 65,536-entry lookup table on a
+    /// truncated float, and its axis comes from `java.lang.Math.sin` on a
+    /// double. They are different functions and the difference is large enough
+    /// to move a cell.
+    #[test]
+    fn the_two_sines_a_vein_uses_are_not_the_same_function() {
+        let mut biggest = 0.0f64;
+        for k in 0..64 {
+            let along = k as f32 / 64.0;
+            let table = f64::from(mth_sin(std::f32::consts::PI * along));
+            let real = (f64::from(std::f32::consts::PI * along)).sin();
+            biggest = biggest.max((table - real).abs());
+        }
+        assert!(
+            biggest > 1.0e-5,
+            "the table and the real sine differ by {biggest}, which is too little to matter"
+        );
+    }
+
+    /// The whole stage, end to end: a solid chunk of the default block, one ore
+    /// feature, and cells that changed.
+    #[test]
+    fn an_ore_writes_its_own_block_into_the_default_one() {
+        let (pack, biomes) = one_ore("writes", 20, 12);
+        let features = compiled(&pack, &biomes);
+        let mut placer = features.placer();
+        let (mut materials, heights) = solid_chunk();
+        let (graph, parameters) = nowhere();
+        let mut sampler = crate::biome::Sampler::over(&graph, [0; 6], &parameters);
+        placer.place(0, 0, &mut materials, &heights, &mut sampler, 0);
+        let counts = placer.counts();
+        let written = materials.iter().filter(|&&code| code != 1).count();
+        assert!(written > 0, "an ore that writes nothing is not an ore");
+        assert_eq!(
+            written as u64, counts.written,
+            "and every changed cell was counted"
+        );
+        assert_eq!(
+            counts.seeded,
+            9,
+            "nine origins, one feature each: {counts:?}"
+        );
+    }
+
+    /// The eight chunks around this one write into it, and a generator that ran
+    /// only its own origin would slice every vein flat at the boundary.
+    #[test]
+    fn the_eight_neighbours_write_into_this_chunk_too() {
+        let (pack, biomes) = one_ore("neighbours", 40, 24);
+        let features = compiled(&pack, &biomes);
+        let (graph, parameters) = nowhere();
+        let mut sampler = crate::biome::Sampler::over(&graph, [0; 6], &parameters);
+
+        let mut placer = features.placer();
+        let (mut all, heights) = solid_chunk();
+        placer.place(0, 0, &mut all, &heights, &mut sampler, 0);
+
+        // The same chunk with only its own origin run, by hand.
+        let mut alone = features.placer();
+        let (mut mine, _) = solid_chunk();
+        alone.chunk(0, 0, 0, 0, &mut mine, &heights, &mut sampler, 0);
+
+        let extra = all
+            .iter()
+            .zip(&mine)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            extra > 0,
+            "the neighbours put nothing in this chunk, so the ring is doing nothing"
+        );
+        // Every cell the lone origin wrote is still written, because the ring
+        // includes it.
+        for (index, (both, one)) in all.iter().zip(&mine).enumerate() {
+            if *one != 1 {
+                assert_ne!(*both, 1, "cell {index} lost a write the centre origin made");
+            }
+        }
+    }
+
+    /// An ore replaces what an ore two features earlier wrote, which is why the
+    /// masks cannot be built while the palette is still growing.
+    #[test]
+    fn an_ore_replaces_the_block_an_earlier_ore_wrote() {
+        let pack = Pack::new("layered");
+        pack.tag("base", &["minecraft:stone"]);
+        pack.tag("second", &["minecraft:tuff"]);
+        pack.ore("ore_tuff", 40, -60, 60, 32, "minecraft:tuff", "minecraft:base", true);
+        pack.ore(
+            "ore_coal",
+            40,
+            -60,
+            60,
+            16,
+            "minecraft:coal_ore",
+            "minecraft:second",
+            true,
+        );
+        pack.biome(
+            "plains",
+            &[&[], &[], &[], &[], &[], &[], &["minecraft:ore_tuff", "minecraft:ore_coal"]],
+        );
+        let biomes = vec!["minecraft:plains".to_owned()];
+        let features = compiled(&pack, &biomes);
+        let coal = features
+            .placed
+            .iter()
+            .find(|entry| entry.name == "minecraft:ore_coal")
+            .expect("the pack names it");
+        let tuff = features
+            .placed
+            .iter()
+            .find(|entry| entry.name == "minecraft:ore_tuff")
+            .expect("the pack names it");
+        let tuff_code = tuff.ore.as_ref().expect("an ore").targets[0].code;
+        assert!(
+            coal.ore.as_ref().expect("an ore").targets[0]
+                .replaces
+                .contains(tuff_code),
+            "coal must be able to replace the tuff written before it"
+        );
+        assert!(
+            !tuff.ore.as_ref().expect("an ore").targets[0]
+                .replaces
+                .contains(tuff_code),
+            "and tuff must not replace itself, or one vein would eat the next"
+        );
+    }
+
+    /// A feature type this generator does not run is still read, numbered and
+    /// ordered — its position is what the ones around it are seeded from — and
+    /// it is counted by name.
+    #[test]
+    fn an_unrun_feature_keeps_its_place_in_the_order_and_is_counted() {
+        let pack = Pack::new("skipped");
+        pack.tag("stone_ore_replaceables", &["minecraft:stone"]);
+        pack.other("patch_grass", "minecraft:random_patch");
+        pack.ore(
+            "ore_coal",
+            8,
+            -60,
+            60,
+            8,
+            "minecraft:coal_ore",
+            "minecraft:stone_ore_replaceables",
+            true,
+        );
+        pack.biome(
+            "plains",
+            &[&[], &[], &[], &[], &[], &[], &["minecraft:patch_grass", "minecraft:ore_coal"]],
+        );
+        let biomes = vec!["minecraft:plains".to_owned()];
+        let features = compiled(&pack, &biomes);
+        assert_eq!(features.coverage(), (1, 2));
+        assert_eq!(features.skipped().get("minecraft:random_patch"), Some(&1));
+        assert_eq!(
+            features.steps[6].len(),
+            2,
+            "the skipped feature still holds a position"
+        );
+        let coal = features.steps[6]
+            .iter()
+            .position(|&which| features.placed[which as usize].name == "minecraft:ore_coal")
+            .expect("it is in the step");
+        assert_eq!(coal, 1, "and the ore is second, not first");
+    }
+
+    /// `OCEAN_FLOOR_WG` is asked of the caller and not decided here. Until it
+    /// answers for every block, nothing is placed at all — because a generator
+    /// that guessed the heightmap would put ore in the sky.
+    #[test]
+    fn nothing_is_placed_until_the_caller_says_what_blocks_motion() {
+        let (pack, biomes) = one_ore("unbound", 20, 12);
+        let mut features = Features::over(&pack.dir, &settings(), 42, &biomes, &[])
+            .expect("the pack compiles")
+            .expect("the pack names an ore");
+        assert!(!features.ocean_floor_bound());
+        let unknown = features.bind_ocean_floor(&[], |_| None);
+        assert_eq!(
+            unknown,
+            vec!["minecraft:stone".to_owned(), "minecraft:coal_ore".to_owned()],
+            "the dimension's own block and the feature's own, both asked for"
+        );
+        assert!(!features.ocean_floor_bound());
+        features.bind_biomes(|_| Some(0));
+
+        let mut placer = features.placer();
+        let (mut materials, heights) = solid_chunk();
+        let (graph, parameters) = nowhere();
+        let mut sampler = crate::biome::Sampler::over(&graph, [0; 6], &parameters);
+        placer.place(0, 0, &mut materials, &heights, &mut sampler, 0);
+        assert!(materials.iter().all(|&code| code == 1), "nothing was placed");
+        assert_eq!(placer.counts(), Counts::default());
+    }
+
+    /// A vein is not drawn at all when its floor is above the ground, which is
+    /// the whole reason the upper ore bands do not fill the sky.
+    #[test]
+    fn a_vein_above_the_ground_is_never_drawn() {
+        // A band well above the world's floor, so that "the ground is at the
+        // floor" really does put every vein's own floor above it.
+        let pack = Pack::new("sky");
+        pack.tag("stone_ore_replaceables", &["minecraft:stone"]);
+        pack.ore(
+            "ore_coal",
+            30,
+            0,
+            60,
+            12,
+            "minecraft:coal_ore",
+            "minecraft:stone_ore_replaceables",
+            true,
+        );
+        pack.biome(
+            "plains",
+            &[&[], &[], &[], &[], &[], &[], &["minecraft:ore_coal"]],
+        );
+        let biomes = vec!["minecraft:plains".to_owned()];
+        let features = compiled(&pack, &biomes);
+        let (graph, parameters) = nowhere();
+        let mut sampler = crate::biome::Sampler::over(&graph, [0; 6], &parameters);
+
+        let mut high = features.placer();
+        let (mut materials, heights) = solid_chunk();
+        high.place(0, 0, &mut materials, &heights, &mut sampler, 0);
+        assert!(high.counts().veins > 0);
+
+        let mut low = features.placer();
+        let (mut buried, _) = solid_chunk();
+        // The ground is at the world's floor everywhere, so every vein's floor
+        // is above it.
+        let sunk = vec![-64i16; WINDOW * WINDOW];
+        low.place(0, 0, &mut buried, &sunk, &mut sampler, 0);
+        assert_eq!(low.counts().veins, 0, "{:?}", low.counts());
+        assert_eq!(low.counts().written, 0);
+        assert!(buried.iter().all(|&code| code == 1));
+        // And the seeds were still set, so the two runs differ by the ground
+        // and not by the stream.
+        assert_eq!(low.counts().seeded, high.counts().seeded);
+    }
+
+    /// The heights cache answers for the chunk it was given and for no other.
+    #[test]
+    fn the_height_cache_answers_for_the_chunk_it_was_given() {
+        let mut cache = Heights::new();
+        let mut column = [7i16; 256];
+        cache.put(3, -4, &column);
+        assert_eq!(cache.get(3, -4).map(|row| row[0]), Some(7));
+        assert!(cache.get(4, -4).is_none());
+        // A chunk that lands in the same slot evicts it rather than answering
+        // for the wrong one.
+        column.fill(9);
+        cache.put(3 + CACHE_COLUMNS, -4, &column);
+        assert!(
+            cache.get(3, -4).is_none(),
+            "an evicted entry must miss, not answer for its neighbour"
+        );
     }
 }

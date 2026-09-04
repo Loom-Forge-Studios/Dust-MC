@@ -189,7 +189,10 @@ impl Rarity {
 }
 
 /// A compiled graph, its splines, and the noises it names.
-#[derive(Debug, Clone)]
+///
+/// `Default` is the empty graph — no nodes, no noises — which is what a caller
+/// that has to hand over an evaluator it will never ask anything of uses.
+#[derive(Debug, Clone, Default)]
 pub struct Graph {
     pub nodes: Vec<Node>,
     pub splines: Vec<Spline>,

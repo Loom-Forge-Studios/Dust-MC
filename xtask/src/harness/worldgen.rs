@@ -435,6 +435,12 @@ struct Scores {
     block_agree: u64,
     /// What Minecraft has where Dust is wrong, most common first.
     wanted: BTreeMap<String, u64>,
+    /// **Both sides of the same cells**, paired. One list says a block is
+    /// missing and cannot say whether it is missing because it was never placed
+    /// or because it was placed one cell over — and those are different
+    /// stages. The biome row has been printing both sides since it was written;
+    /// this is the block row catching up.
+    swapped: BTreeMap<String, u64>,
     /// Wall time spent building the columns, the reads excluded.
     built: Duration,
     /// Bytes the built columns' paletted containers hold — block states and
@@ -1136,6 +1142,14 @@ fn score(
                     scores.block_agree += 1;
                 } else {
                     *scores.wanted.entry(block_name(wanted)).or_default() += 1;
+                    *scores
+                        .swapped
+                        .entry(format!(
+                            "{} where Minecraft has {}",
+                            block_name(built),
+                            block_name(wanted)
+                        ))
+                        .or_default() += 1;
                 }
                 let Some(ground) = want else { continue };
                 if y >= ground {
@@ -1278,6 +1292,7 @@ fn report(rung: Rung, scores: &Scores) {
         percent(scores.block_agree, scores.cells)
     );
     histogram("      Minecraft has where Dust is wrong:", &scores.wanted);
+    histogram("      Dust has, where they disagree:", &scores.swapped);
 }
 
 fn histogram(label: &str, counts: &BTreeMap<String, u64>) {
