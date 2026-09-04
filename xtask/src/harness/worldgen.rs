@@ -620,7 +620,12 @@ fn generator(
                     "  no feature runs: {} block(s) have no OCEAN_FLOOR_WG answer in this \
                      checkout ({}). `cargo xtask extract --version {version} --only constants`",
                     unbound.len(),
-                    unbound.iter().take(4).cloned().collect::<Vec<_>>().join(", ")
+                    unbound
+                        .iter()
+                        .take(4)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
             let mut skipped: Vec<(&String, &usize)> = features.skipped().iter().collect();
@@ -643,7 +648,9 @@ fn generator(
                 );
             }
         }
-        None => println!("features: none — no biome of this dimension names one this generator runs"),
+        None => {
+            println!("features: none — no biome of this dimension names one this generator runs")
+        }
     }
     Ok(generator)
 }
@@ -1024,12 +1031,7 @@ fn build(
         }
     } else if matches!(
         rung,
-        Rung::Biomes
-            | Rung::Density
-            | Rung::Surface
-            | Rung::Aquifers
-            | Rung::Carve
-            | Rung::Feature
+        Rung::Biomes | Rung::Density | Rung::Surface | Rung::Aquifers | Rung::Carve | Rung::Feature
     ) {
         // Quart coordinates: the cell index, which is the block position
         // shifted down by two. The x and z of the chunk are added first,

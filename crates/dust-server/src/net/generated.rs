@@ -124,14 +124,14 @@ impl GeneratedWorld {
         // if this build's registry has no lava — a generator that quietly
         // defaulted it would fill a deep cave with air and look right.
         let lava = state_of(&dust_gen::aquifer::Aquifer::lava_block())?;
-        let surface = match generator.surface() {
-            Some(rules) => rules
-                .palette()
-                .iter()
-                .map(state_of)
-                .collect::<Result<Vec<u32>, MissingBlock>>()?,
-            None => Vec::new(),
-        };
+        // One palette: the surface rules' blocks and then the ones the feature
+        // stage writes. Two lists would map an ore's material code onto
+        // whichever surface block happened to sit at that index.
+        let surface = generator
+            .block_palette()
+            .iter()
+            .map(state_of)
+            .collect::<Result<Vec<u32>, MissingBlock>>()?;
         Ok(Self {
             emission: super::world::emission_of(constants.as_deref()),
             height: flat.height(),
@@ -228,7 +228,7 @@ impl GeneratedWorld {
         let top = min_y + self.height.height() as i32;
         {
             let materials = if with_biomes {
-                columns.carve(pos.x, pos.z)
+                columns.features(pos.x, pos.z)
             } else {
                 columns.terrain(pos.x, pos.z)
             };
@@ -378,8 +378,30 @@ pub fn beside(
     // have is reported and left unbound rather than matched against
     // everything, because a `biome_is` that matched everything would put a
     // beach across a continent.
-    let unbound = generator.bind_surface_biomes(|name| names.biome(name));
+    let mut unbound = generator.bind_surface_biomes(|name| names.biome(name));
+    // The feature stage asks the running build two things rather than deciding
+    // them: which id each biome name has, and which blocks count towards
+    // `OCEAN_FLOOR_WG` -- the heightmap an ore consults before it draws a vein
+    // at all. The second is a column of the operator's own constants table.
+    // Without an answer for every block no feature runs, and the boot line says
+    // so rather than putting ore in the sky.
+    let ocean_floor = constants
+        .as_deref()
+        .and_then(|table| table.flag("OCEAN_FLOOR_WG").map(|flag| (table, flag)));
+    unbound.extend(generator.bind_features(
+        |name| names.biome(name),
+        |spec| {
+            let (table, flag) = ocean_floor?;
+            Some(table.is_set(flag, state_of(spec).ok()?))
+        },
+    ));
+    unbound.sort();
+    unbound.dedup();
     let surface_blocks = generator.surface().map_or(0, |rules| rules.palette().len());
+    let features = generator
+        .features()
+        .filter(|features| features.ocean_floor_bound())
+        .map_or((0, 0), dust_gen::feature::Features::coverage);
     let settings = generator.settings().clone();
     let world = GeneratedWorld::new(
         generator,
@@ -400,6 +422,7 @@ pub fn beside(
             default_block: settings.default_block.name,
             default_fluid: settings.default_fluid.name,
             surface_blocks,
+            features,
             unbound,
         },
     )))
@@ -418,6 +441,10 @@ pub struct Report {
     /// How many distinct blocks the dimension's surface rules can write. Zero
     /// means the settings carried no rules and the ground is bare stone.
     pub surface_blocks: usize,
+    /// Placed features this generator runs, and how many the pack's biomes name
+    /// altogether. `(0, 0)` means no feature runs -- either the pack names none
+    /// this generator knows, or nothing answered for `OCEAN_FLOOR_WG`.
+    pub features: (usize, usize),
     /// Biomes the rules ask about that this registry does not have.
     pub unbound: Vec<String>,
 }
@@ -429,9 +456,13 @@ impl Report {
         } else {
             format!("surface rules over {} block(s)", self.surface_blocks)
         };
+        let features = match self.features {
+            (0, 0) => "no features".to_owned(),
+            (running, read) => format!("{running} of {read} placed feature(s)"),
+        };
         let mut line = format!(
             "generating from seed {seed}: {} climate region(s) over {} biome(s), \
-             {} above sea level {}, {surface}",
+             {} above sea level {}, {surface}, {features}",
             self.regions, self.biomes, self.default_fluid, self.sea_level,
         );
         if !self.moved.is_empty() {
@@ -443,7 +474,8 @@ impl Report {
         }
         if !self.unbound.is_empty() {
             line.push_str(&format!(
-                " — and the surface rules name {} biome(s) this registry does not have: {}",
+                " — and {} name(s) the rules or the features ask about are not in this \
+                 registry: {}",
                 self.unbound.len(),
                 self.unbound.join(", ")
             ));

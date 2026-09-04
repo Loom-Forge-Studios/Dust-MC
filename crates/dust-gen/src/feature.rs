@@ -136,10 +136,6 @@ impl CodeSet {
     fn contains(self, code: u8) -> bool {
         self.0[usize::from(code) >> 6] >> (code & 63) & 1 == 1
     }
-
-    fn is_empty(self) -> bool {
-        self.0 == [0; CODES / 64]
-    }
 }
 
 /// One `OreConfiguration.TargetBlockState`: what it may replace, and what it
@@ -343,7 +339,8 @@ impl Features {
             let mut named: Vec<u32> = Vec::new();
             for (step, list) in per_step.iter().enumerate() {
                 for name in list {
-                    let next = u32::try_from(order.len()).expect("a pack has fewer than 4G features");
+                    let next =
+                        u32::try_from(order.len()).expect("a pack has fewer than 4G features");
                     let index = *index_of.entry(name.clone()).or_insert_with(|| {
                         order.push(name.clone());
                         next
@@ -474,6 +471,15 @@ impl Features {
     /// placed features name one.
     pub fn skipped(&self) -> &BTreeMap<String, usize> {
         &self.skipped
+    }
+
+    /// The placed features this generator runs, by name and by the
+    /// configured-feature type under them.
+    pub fn running(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.placed
+            .iter()
+            .filter(|entry| entry.chain.is_some())
+            .map(|entry| (entry.name.as_str(), entry.kind.as_str()))
     }
 
     /// How many placed features are run, and how many were read in total.
@@ -748,8 +754,8 @@ fn read_chain(
                         .and_then(|value| i32::try_from(value).ok())
                         .ok_or_else(|| malformed(path, "`count` is a whole number"))?,
                 ),
-                Some(object) if object.get("type").and_then(Value::as_str)
-                    == Some("minecraft:uniform") =>
+                Some(object)
+                    if object.get("type").and_then(Value::as_str) == Some("minecraft:uniform") =>
                 {
                     Modifier::CountUniform {
                         min: whole(object, "min_inclusive", path)?,
@@ -1078,9 +1084,9 @@ impl Placer<'_> {
         zoom_seed: i64,
     ) {
         let features = self.features;
-        let decoration =
-            self.rng
-                .set_decoration_seed(features.seed, chunk_x * 16, chunk_z * 16);
+        let decoration = self
+            .rng
+            .set_decoration_seed(features.seed, chunk_x * 16, chunk_z * 16);
         for (step, list) in features.steps.iter().enumerate() {
             for (position, &which) in list.iter().enumerate() {
                 let entry = &features.placed[which as usize];
@@ -1191,7 +1197,16 @@ fn run(
         Modifier::Count(count) => {
             for _ in 0..count {
                 run(
-                    features, rng, nodes, mask, counts, chain, depth + 1, position, ore, site,
+                    features,
+                    rng,
+                    nodes,
+                    mask,
+                    counts,
+                    chain,
+                    depth + 1,
+                    position,
+                    ore,
+                    site,
                     biomes,
                 );
             }
@@ -1200,7 +1215,16 @@ fn run(
             let count = rng.between_inclusive(min, max);
             for _ in 0..count {
                 run(
-                    features, rng, nodes, mask, counts, chain, depth + 1, position, ore, site,
+                    features,
+                    rng,
+                    nodes,
+                    mask,
+                    counts,
+                    chain,
+                    depth + 1,
+                    position,
+                    ore,
+                    site,
                     biomes,
                 );
             }
@@ -1210,7 +1234,16 @@ fn run(
             // `1.0f / 3` is 0.33333334 and not a third.
             if rng.next_f32() < 1.0f32 / chance as f32 {
                 run(
-                    features, rng, nodes, mask, counts, chain, depth + 1, position, ore, site,
+                    features,
+                    rng,
+                    nodes,
+                    mask,
+                    counts,
+                    chain,
+                    depth + 1,
+                    position,
+                    ore,
+                    site,
                     biomes,
                 );
             }
@@ -1253,7 +1286,16 @@ fn run(
                 || features.names_here(site, position, biomes)
             {
                 run(
-                    features, rng, nodes, mask, counts, chain, depth + 1, position, ore, site,
+                    features,
+                    rng,
+                    nodes,
+                    mask,
+                    counts,
+                    chain,
+                    depth + 1,
+                    position,
+                    ore,
+                    site,
                     biomes,
                 );
             } else {
@@ -1350,8 +1392,7 @@ fn place_ore(
         let z = mth_lerp(f64::from(along), z_start, z_end);
         let spread = rng.next_f64() * f64::from(size) / 16.0;
         // `Mth.sin`, and the `+ 1.0` is a float add before anything widens.
-        let radius =
-            (f64::from(mth_sin(std::f32::consts::PI * along) + 1.0) * spread + 1.0) / 2.0;
+        let radius = (f64::from(mth_sin(std::f32::consts::PI * along) + 1.0) * spread + 1.0) / 2.0;
         nodes[k * 4] = x;
         nodes[k * 4 + 1] = y;
         nodes[k * 4 + 2] = z;
@@ -1389,7 +1430,8 @@ fn place_ore(
     let span = if wide <= 0 || tall <= 0 {
         0
     } else {
-        (wide as usize) + (tall as usize) * (wide as usize)
+        (wide as usize)
+            + (tall as usize) * (wide as usize)
             + (wide as usize) * (tall as usize) * (wide as usize)
             + 1
     };
@@ -1451,12 +1493,18 @@ fn place_ore(
                         if !target.replaces.contains(current) {
                             continue;
                         }
-                        let skip = if !(ore.discard_on_air > 0.0) {
+                        // Vanilla writes these as negated comparisons, which
+                        // matters at the ends: a chance of zero skips the air
+                        // check without drawing, a chance of one always makes
+                        // it without drawing, and only a chance strictly
+                        // between the two costs a draw.
+                        let chance = ore.discard_on_air;
+                        let skip = if chance <= 0.0 || chance.is_nan() {
                             true
-                        } else if !(ore.discard_on_air < 1.0) {
+                        } else if chance >= 1.0 {
                             false
                         } else {
-                            rng.next_f32() >= ore.discard_on_air
+                            rng.next_f32() >= chance
                         };
                         if !skip && adjacent_to_air(site, counts, x, y, z) {
                             continue;
@@ -1585,12 +1633,6 @@ impl Features {
                 }
             }
         }
-    }
-
-    /// Whether a code counts towards `OCEAN_FLOOR_WG`, for the checks.
-    #[cfg(test)]
-    fn floors(&self, code: u8) -> bool {
-        self.ocean_floor.contains(code)
     }
 }
 
@@ -1782,7 +1824,10 @@ mod tests {
             "minecraft:stone_ore_replaceables",
             true,
         );
-        pack.biome("plains", &[&[], &[], &[], &[], &[], &[], &["minecraft:ore_coal"]]);
+        pack.biome(
+            "plains",
+            &[&[], &[], &[], &[], &[], &[], &["minecraft:ore_coal"]],
+        );
         (pack, vec!["minecraft:plains".to_owned()])
     }
 
@@ -2015,15 +2060,33 @@ mod tests {
                 true,
             );
         }
-        let step = |list: &[&str]| -> Vec<Vec<String>> { vec![list.iter().map(|s| (*s).to_owned()).collect()] };
+        let step = |list: &[&str]| -> Vec<Vec<String>> {
+            vec![list.iter().map(|s| (*s).to_owned()).collect()]
+        };
         let _ = step;
         pack.biome(
             "first",
-            &[&[], &[], &[], &[], &[], &[], &["minecraft:ore_a", "minecraft:ore_b"]],
+            &[
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &["minecraft:ore_a", "minecraft:ore_b"],
+            ],
         );
         pack.biome(
             "second",
-            &[&[], &[], &[], &[], &[], &[], &["minecraft:ore_c", "minecraft:ore_a"]],
+            &[
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &["minecraft:ore_c", "minecraft:ore_a"],
+            ],
         );
         let biomes = vec!["minecraft:first".to_owned(), "minecraft:second".to_owned()];
         let features = compiled(&pack, &biomes);
@@ -2078,8 +2141,7 @@ mod tests {
             "and every changed cell was counted"
         );
         assert_eq!(
-            counts.seeded,
-            9,
+            counts.seeded, 9,
             "nine origins, one feature each: {counts:?}"
         );
     }
@@ -2102,11 +2164,7 @@ mod tests {
         let (mut mine, _) = solid_chunk();
         alone.chunk(0, 0, 0, 0, &mut mine, &heights, &mut sampler, 0);
 
-        let extra = all
-            .iter()
-            .zip(&mine)
-            .filter(|(a, b)| a != b)
-            .count();
+        let extra = all.iter().zip(&mine).filter(|(a, b)| a != b).count();
         assert!(
             extra > 0,
             "the neighbours put nothing in this chunk, so the ring is doing nothing"
@@ -2127,7 +2185,16 @@ mod tests {
         let pack = Pack::new("layered");
         pack.tag("base", &["minecraft:stone"]);
         pack.tag("second", &["minecraft:tuff"]);
-        pack.ore("ore_tuff", 40, -60, 60, 32, "minecraft:tuff", "minecraft:base", true);
+        pack.ore(
+            "ore_tuff",
+            40,
+            -60,
+            60,
+            32,
+            "minecraft:tuff",
+            "minecraft:base",
+            true,
+        );
         pack.ore(
             "ore_coal",
             40,
@@ -2140,7 +2207,15 @@ mod tests {
         );
         pack.biome(
             "plains",
-            &[&[], &[], &[], &[], &[], &[], &["minecraft:ore_tuff", "minecraft:ore_coal"]],
+            &[
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &["minecraft:ore_tuff", "minecraft:ore_coal"],
+            ],
         );
         let biomes = vec!["minecraft:plains".to_owned()];
         let features = compiled(&pack, &biomes);
@@ -2189,7 +2264,15 @@ mod tests {
         );
         pack.biome(
             "plains",
-            &[&[], &[], &[], &[], &[], &[], &["minecraft:patch_grass", "minecraft:ore_coal"]],
+            &[
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &["minecraft:patch_grass", "minecraft:ore_coal"],
+            ],
         );
         let biomes = vec!["minecraft:plains".to_owned()];
         let features = compiled(&pack, &biomes);
@@ -2220,7 +2303,10 @@ mod tests {
         let unknown = features.bind_ocean_floor(&[], |_| None);
         assert_eq!(
             unknown,
-            vec!["minecraft:stone".to_owned(), "minecraft:coal_ore".to_owned()],
+            vec![
+                "minecraft:stone".to_owned(),
+                "minecraft:coal_ore".to_owned()
+            ],
             "the dimension's own block and the feature's own, both asked for"
         );
         assert!(!features.ocean_floor_bound());
@@ -2231,7 +2317,10 @@ mod tests {
         let (graph, parameters) = nowhere();
         let mut sampler = crate::biome::Sampler::over(&graph, [0; 6], &parameters);
         placer.place(0, 0, &mut materials, &heights, &mut sampler, 0);
-        assert!(materials.iter().all(|&code| code == 1), "nothing was placed");
+        assert!(
+            materials.iter().all(|&code| code == 1),
+            "nothing was placed"
+        );
         assert_eq!(placer.counts(), Counts::default());
     }
 
