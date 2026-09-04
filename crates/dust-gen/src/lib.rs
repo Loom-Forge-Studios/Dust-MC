@@ -21,6 +21,7 @@
 pub mod aquifer;
 pub mod biome;
 pub mod carver;
+pub mod feature;
 pub mod generated;
 pub mod noise;
 pub mod ore_density;

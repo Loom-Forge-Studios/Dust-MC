@@ -601,3 +601,147 @@ pub fn mth_sin(value: f32) -> f32 {
 pub fn mth_cos(value: f32) -> f32 {
     sine_table()[(((value * 10430.378 + 16384.0) as i32) & 65535) as usize]
 }
+
+/// `WorldgenRandom` over an `XoroshiroRandomSource`: the stream a chunk's
+/// **features** are drawn from, and neither of the two generators it is made
+/// of.
+///
+/// `ChunkGenerator.applyBiomeDecoration` builds `new WorldgenRandom(new
+/// XoroshiroRandomSource(...))`, and `WorldgenRandom` overrides exactly two
+/// methods — `next(bits)` and `setSeed`. Every draw above those is inherited
+/// from `BitRandomSource`, which is `java.util.Random`'s own arithmetic: the
+/// power-of-two-and-rejection `nextInt(bound)`, `nextFloat` as 24 bits, and
+/// `nextDouble` as **two** draws of 26 and 27 bits. So a feature's draws are
+/// Java's 1995 algorithms fed by xoroshiro's top bits.
+///
+/// Both halves matter and both are easy to get wrong on their own. Drawing
+/// straight from [`Xoroshiro`] gives Lemire's `nextInt` and a one-draw
+/// `nextDouble`; drawing from [`Legacy`] gives the right algorithms off the
+/// wrong bits. Either one puts every ore somewhere else while passing any test
+/// that only asks whether the numbers look uniform.
+#[derive(Debug, Clone)]
+pub struct Worldgen {
+    source: Xoroshiro,
+}
+
+impl Worldgen {
+    /// A stream whose seed has not been set yet.
+    ///
+    /// Vanilla seeds the wrapped source from `RandomSupport.generateUniqueSeed`
+    /// — a nanosecond clock — and overwrites it with `setDecorationSeed` before
+    /// the first draw, so the value here cannot reach a world.
+    pub fn new() -> Self {
+        Self {
+            source: Xoroshiro::from_seed(0),
+        }
+    }
+
+    /// `WorldgenRandom.setSeed`, which forwards to the wrapped source and does
+    /// **not** install a legacy generator.
+    pub fn set_seed(&mut self, seed: i64) {
+        self.source = Xoroshiro::from_seed(seed);
+    }
+
+    /// `WorldgenRandom.next(bits)`: the top `bits` of one xoroshiro output.
+    fn next(&mut self, bits: u32) -> i32 {
+        (self.source.next_u64() >> (64 - bits)) as u32 as i32
+    }
+
+    /// `java.util.Random.nextInt(bound)`, power-of-two path and rejection loop.
+    pub fn next_i32_below(&mut self, bound: i32) -> i32 {
+        assert!(bound > 0, "a bound is positive");
+        if bound & (bound - 1) == 0 {
+            return ((i64::from(bound).wrapping_mul(i64::from(self.next(31)))) >> 31) as i32;
+        }
+        loop {
+            let bits = self.next(31);
+            let value = bits % bound;
+            if bits.wrapping_sub(value).wrapping_add(bound - 1) >= 0 {
+                return value;
+            }
+        }
+    }
+
+    /// `Mth.randomBetweenInclusive`, which has **no** `min >= max` early-out
+    /// and so always draws. `Mth.nextInt` is the one that does; picking that
+    /// one instead loses a draw wherever a height range is a single block.
+    pub fn between_inclusive(&mut self, min: i32, max: i32) -> i32 {
+        self.next_i32_below(max - min + 1) + min
+    }
+
+    /// `java.util.Random.nextLong`: two 32-bit draws, added rather than
+    /// or-ed, so the low half sign-extends.
+    pub fn next_i64(&mut self) -> i64 {
+        (i64::from(self.next(32)) << 32).wrapping_add(i64::from(self.next(32)))
+    }
+
+    pub fn next_f32(&mut self) -> f32 {
+        self.next(24) as f32 * 5.960_464_5E-8
+    }
+
+    /// `java.util.Random.nextDouble`: 26 bits then 27, which is **two**
+    /// xoroshiro outputs and not one.
+    pub fn next_f64(&mut self) -> f64 {
+        ((i64::from(self.next(26)) << 27).wrapping_add(i64::from(self.next(27)))) as f64
+            * 1.110_223_024_625_156_5E-16
+    }
+
+    /// `WorldgenRandom.setDecorationSeed`: the seed every feature of one chunk
+    /// is derived from, and the return value the caller keeps.
+    ///
+    /// The two `nextLong` draws are four xoroshiro outputs, and they are taken
+    /// from the *seeded* stream — which is what makes a chunk's features depend
+    /// on the world seed twice over.
+    pub fn set_decoration_seed(&mut self, level_seed: i64, block_x: i32, block_z: i32) -> i64 {
+        self.set_seed(level_seed);
+        let a = self.next_i64() | 1;
+        let b = self.next_i64() | 1;
+        let seed = (i64::from(block_x).wrapping_mul(a))
+            .wrapping_add(i64::from(block_z).wrapping_mul(b))
+            ^ level_seed;
+        self.set_seed(seed);
+        seed
+    }
+
+    /// `WorldgenRandom.setFeatureSeed`. `10000 * step` is 32-bit arithmetic in
+    /// vanilla and is kept that way.
+    pub fn set_feature_seed(&mut self, decoration_seed: i64, index: i32, step: i32) {
+        let salt = 10_000i32.wrapping_mul(step);
+        self.set_seed(
+            decoration_seed
+                .wrapping_add(i64::from(index))
+                .wrapping_add(i64::from(salt)),
+        );
+    }
+}
+
+impl Default for Worldgen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `Mth.ceil(float)`.
+pub fn mth_ceil(value: f32) -> i32 {
+    let truncated = value as i32;
+    if value > truncated as f32 {
+        truncated + 1
+    } else {
+        truncated
+    }
+}
+
+/// `Mth.floor(double)`.
+pub fn mth_floor(value: f64) -> i32 {
+    let truncated = value as i32;
+    if value < f64::from(truncated) {
+        truncated - 1
+    } else {
+        truncated
+    }
+}
+
+/// `Mth.lerp(delta, start, end)`.
+pub fn mth_lerp(delta: f64, start: f64, end: f64) -> f64 {
+    start + delta * (end - start)
+}

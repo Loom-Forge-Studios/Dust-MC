@@ -545,6 +545,9 @@ pub struct Generator {
     parameters: crate::biome::BiomeParameters,
     /// The dimension's carvers, or `None` when no biome of it names any.
     carvers: Option<crate::carver::Carvers>,
+    /// The dimension's features, or `None` when no biome of it names one this
+    /// generator runs.
+    features: Option<crate::feature::Features>,
     /// The seed the biome blur fiddles with, which is a hash of the world seed
     /// and not the world seed. Computed once because it is a SHA-256 and a
     /// surface rule asks for a biome at every solid block of every column.
@@ -576,10 +579,25 @@ impl Generator {
             .unwrap_or_default();
         let carvers =
             crate::carver::Carvers::over(data_root, terrain.settings(), seed, &biomes, &palette)?;
+        // The feature sorter numbers features by first appearance scanning
+        // biomes in the biome source's own order, and that number is what every
+        // feature of a step is seeded from -- so this list is the parameter
+        // table's order with repeats dropped, and not the sorted one the
+        // carvers take.
+        let mut named: Vec<String> = Vec::new();
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for region in parameters.regions() {
+            if seen.insert(region.name.as_str()) {
+                named.push(region.name.clone());
+            }
+        }
+        let features =
+            crate::feature::Features::over(data_root, terrain.settings(), seed, &named, &palette)?;
         Ok(Self {
             terrain,
             parameters,
             carvers,
+            features,
             zoom_seed: crate::noise::rng::obfuscate_seed(seed),
         })
     }
@@ -587,6 +605,56 @@ impl Generator {
     /// The dimension's carvers, or `None` when no biome of it names any.
     pub fn carvers(&self) -> Option<&crate::carver::Carvers> {
         self.carvers.as_ref()
+    }
+
+    /// The dimension's features, or `None` when no biome of it names one this
+    /// generator runs.
+    pub fn features(&self) -> Option<&crate::feature::Features> {
+        self.features.as_ref()
+    }
+
+    /// Every block a generated cell can hold beyond the dimension's own three:
+    /// the surface rules' palette, then the blocks the features write. A
+    /// material code of `4 + i` is entry `i` of this list.
+    ///
+    /// One list because there is one code space. Two callers resolved the
+    /// surface palette on its own before features existed, and either of them
+    /// left as it was would map an ore's code onto whatever surface block
+    /// happened to sit at that index.
+    pub fn block_palette(&self) -> Vec<crate::noise::build::BlockSpec> {
+        let mut palette = match self.surface() {
+            Some(rules) => rules.palette().to_vec(),
+            None => Vec::new(),
+        };
+        if let Some(features) = &self.features {
+            palette.extend_from_slice(features.palette());
+        }
+        palette
+    }
+
+    /// Point the feature stage's biome filter at a registry's own ids, and tell
+    /// it which of `block_palette`'s blocks count towards `OCEAN_FLOOR_WG`.
+    ///
+    /// Returns the names it could not bind. **Until both answer for everything,
+    /// no feature runs**, which is what `Features::ocean_floor_bound` reports:
+    /// a generator that guessed the heightmap would place ore in the sky.
+    pub fn bind_features(
+        &mut self,
+        id_of: impl Fn(&str) -> Option<u32>,
+        blocks: impl Fn(&crate::noise::build::BlockSpec) -> Option<bool>,
+    ) -> Vec<String> {
+        let surface = match self.terrain.router().surface.as_ref() {
+            Some(rules) => rules.palette().to_vec(),
+            None => Vec::new(),
+        };
+        let Some(features) = self.features.as_mut() else {
+            return Vec::new();
+        };
+        let mut unbound = features.bind_biomes(id_of);
+        unbound.extend(features.bind_ocean_floor(&surface, blocks));
+        unbound.sort();
+        unbound.dedup();
+        unbound
     }
 
     /// The dimension's surface rules, or `None` if its settings carry none.
@@ -645,6 +713,10 @@ impl Generator {
             zoom_seed: self.zoom_seed,
             materials: vec![0u8; self.terrain.cells_per_chunk()],
             cutter: self.carvers.as_ref().map(crate::carver::Carvers::cutter),
+            placer: self.features.as_ref().map(crate::feature::Features::placer),
+            spare: Vec::new(),
+            heights: crate::feature::Heights::new(),
+            window: Vec::new(),
         }
     }
 }
@@ -659,6 +731,12 @@ pub struct Columns<'a> {
     zoom_seed: i64,
     materials: Vec<u8>,
     cutter: Option<crate::carver::Cutter<'a>>,
+    placer: Option<crate::feature::Placer<'a>>,
+    /// A second chunk's materials, built only to read a neighbour's column
+    /// heights off it and then thrown away.
+    spare: Vec<u8>,
+    heights: crate::feature::Heights,
+    window: Vec<i16>,
 }
 
 impl<'a> Columns<'a> {
@@ -720,22 +798,130 @@ impl<'a> Columns<'a> {
     /// statuses run `surface` before `carvers`: a tunnel cuts through finished
     /// ground, which is why `carveBlock` has anything to say about grass.
     pub fn carve(&mut self, chunk_x: i32, chunk_z: i32) -> &[u8] {
+        let mut materials = std::mem::take(&mut self.materials);
+        self.carve_into(chunk_x, chunk_z, &mut materials);
+        self.materials = materials;
+        &self.materials
+    }
+
+    /// The same four stages, written into a buffer the caller owns.
+    ///
+    /// Split out because the feature stage builds a neighbouring chunk purely
+    /// to read its column heights off it, and that chunk's blocks are thrown
+    /// away rather than served.
+    fn carve_into(&mut self, chunk_x: i32, chunk_z: i32, materials: &mut [u8]) {
         let Self {
             filler,
             biomes,
             painter,
             zoom_seed,
-            materials,
-            cutter,
+            ..
         } = self;
         filler.fill_with_aquifer(chunk_x, chunk_z, materials);
         if let Some(painter) = painter.as_mut() {
             painter.paint(chunk_x, chunk_z, materials, biomes, *zoom_seed);
         }
-        if let Some(cutter) = cutter.as_mut() {
-            cutter.carve(chunk_x, chunk_z, materials, filler.flow_mut());
+        if let Some(cutter) = self.cutter.as_mut() {
+            cutter.carve(chunk_x, chunk_z, materials, self.filler.flow_mut());
         }
-        materials
+    }
+
+    /// Everything above, and then the features of this chunk and of the eight
+    /// around it — the whole of what vanilla's `FEATURES` status leaves behind.
+    ///
+    /// Nine origins rather than one because the write radius of that status is
+    /// one chunk: a vein whose origin is next door reaches thirteen blocks in,
+    /// and a generator that ran only its own origin would slice every vein flat
+    /// at the chunk boundary.
+    pub fn features(&mut self, chunk_x: i32, chunk_z: i32) -> &[u8] {
+        if self.placer.is_none() {
+            return self.carve(chunk_x, chunk_z);
+        }
+        let cells = self.materials.len();
+        let mut materials = std::mem::take(&mut self.materials);
+        self.carve_into(chunk_x, chunk_z, &mut materials);
+
+        // The counts belong to the chunk being built. The twenty-four fills
+        // below are scaffolding for a heightmap and would otherwise be reported
+        // as this chunk's carving.
+        let carved = self.cutter.as_ref().map(crate::carver::Cutter::counts);
+        let declined = self.painter.as_ref().map(crate::surface::Painter::declined);
+
+        let radius = crate::feature::WINDOW_RADIUS;
+        let mut column = [0i16; 256];
+        if let Some(features) = self.placer.as_ref().map(crate::feature::Placer::features) {
+            features.column_heights(&materials, &mut column);
+        }
+        self.heights.put(chunk_x, chunk_z, &column);
+        let mut spare = std::mem::take(&mut self.spare);
+        if spare.len() != cells {
+            spare.resize(cells, 0);
+        }
+        for offset_z in -radius..=radius {
+            for offset_x in -radius..=radius {
+                let (near_x, near_z) = (chunk_x + offset_x, chunk_z + offset_z);
+                if self.heights.get(near_x, near_z).is_some() {
+                    continue;
+                }
+                self.carve_into(near_x, near_z, &mut spare);
+                if let Some(features) = self.placer.as_ref().map(crate::feature::Placer::features) {
+                    features.column_heights(&spare, &mut column);
+                }
+                self.heights.put(near_x, near_z, &column);
+            }
+        }
+        self.spare = spare;
+        if let (Some(cutter), Some(counts)) = (self.cutter.as_mut(), carved) {
+            cutter.set_counts(counts);
+        }
+        if let (Some(painter), Some(counts)) = (self.painter.as_mut(), declined) {
+            painter.set_declined(counts);
+        }
+
+        let width = crate::feature::WINDOW;
+        self.window.clear();
+        self.window.resize(width * width, 0);
+        for offset_z in -radius..=radius {
+            for offset_x in -radius..=radius {
+                let heights = self
+                    .heights
+                    .get(chunk_x + offset_x, chunk_z + offset_z)
+                    .expect("every chunk of the window was just filled");
+                let base_x = ((offset_x + radius) * 16) as usize;
+                let base_z = ((offset_z + radius) * 16) as usize;
+                for local_z in 0..16usize {
+                    let row = (base_z + local_z) * width + base_x;
+                    self.window[row..row + 16]
+                        .copy_from_slice(&heights[local_z * 16..local_z * 16 + 16]);
+                }
+            }
+        }
+
+        if let Some(placer) = self.placer.as_mut() {
+            placer.place(
+                chunk_x,
+                chunk_z,
+                &mut materials,
+                &self.window,
+                &mut self.biomes,
+                self.zoom_seed,
+            );
+        }
+        self.materials = materials;
+        &self.materials
+    }
+
+    /// What this chunk's feature stage did, or `None` when the dimension runs
+    /// none.
+    pub fn placing(&self) -> Option<crate::feature::Counts> {
+        self.placer.as_ref().map(crate::feature::Placer::counts)
+    }
+
+    /// Forget what the feature stage has counted so far.
+    pub fn reset_placing(&mut self) {
+        if let Some(placer) = self.placer.as_mut() {
+            placer.reset_counts();
+        }
     }
 
     /// What the carvers have done since this scratch was made, or `None` when

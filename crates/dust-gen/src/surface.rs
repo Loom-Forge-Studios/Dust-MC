@@ -334,6 +334,12 @@ impl<'a> Painter<'a> {
     /// the default fluid — and comes back with surface codes written over the
     /// blocks the rules claimed. Codes at or above three index
     /// [`Rules::palette`].
+    /// Put the counts back to what they were, for a caller that painted a
+    /// chunk it is not going to serve.
+    pub fn set_declined(&mut self, declined: (u64, u64)) {
+        (self.declined, self.bandlands) = declined;
+    }
+
     pub fn paint(
         &mut self,
         chunk_x: i32,

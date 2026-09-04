@@ -259,9 +259,18 @@ enum Rung {
     /// neighbouring chunks' worth of tunnels and canyons, of which this chunk
     /// keeps the part that lands inside it.
     ///
+    /// Carvers have run but nothing has been placed in the world they cut, so
+    /// there is no ore in it at all.
+    Carve,
+    /// The same world with its features placed: `minecraft:ore`, which is the
+    /// coal and iron a player needs and the tuff, andesite, diorite and granite
+    /// that are the four largest single blocks Minecraft has where Dust does
+    /// not. Nine chunks' worth of origins, because a vein whose origin is next
+    /// door still reaches thirteen blocks in.
+    ///
     /// **The last rung a server could run in.** Everything below it reads the
     /// region file.
-    Carve,
+    Feature,
     /// The flat stack again, with each column's grass at the y Minecraft's
     /// `MOTION_BLOCKING` puts it. The terrain's *shape*, and nothing else:
     /// stone is still dirt, an ocean is still filled in solid.
@@ -286,7 +295,7 @@ enum Rung {
 
 impl Rung {
     /// The ladder, in order.
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::Flat,
         Self::FlatAtSeaLevel,
         Self::Biomes,
@@ -294,6 +303,7 @@ impl Rung {
         Self::Surface,
         Self::Aquifers,
         Self::Carve,
+        Self::Feature,
         Self::Heights,
         Self::Carvers,
         Self::BelowTheSurface,
@@ -311,6 +321,7 @@ impl Rung {
                 "+ Dust's aquifers                        (whether a cave drowns you)"
             }
             Self::Carve => "+ Dust's carvers                         (the caves themselves)",
+            Self::Feature => "+ Dust's features                        (ore, and the stone in it)",
             Self::Heights => "+ Minecraft's surface height             (the ceiling above it)",
             Self::Carvers => "+ Minecraft's carvers                    (caves)",
             Self::BelowTheSurface => {
@@ -332,6 +343,7 @@ impl Rung {
                 | Self::Surface
                 | Self::Aquifers
                 | Self::Carve
+                | Self::Feature
         )
     }
 }
@@ -476,7 +488,12 @@ fn spec_state(spec: &dust_gen::noise::build::BlockSpec) -> Result<u32, String> {
 /// rather than defaulted when either is missing — a rung that quietly copied
 /// Minecraft's biomes instead would report a perfect biome score for a
 /// generator that had not run.
-fn generator(version: &str, seed: i64, names: &RegistryNames) -> Result<Generator, String> {
+fn generator(
+    version: &str,
+    seed: i64,
+    names: &RegistryNames,
+    constants: Option<&dust_registry::BlockConstants>,
+) -> Result<Generator, String> {
     let cache = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask lives one level below the workspace root")
@@ -566,6 +583,62 @@ fn generator(version: &str, seed: i64, names: &RegistryNames) -> Result<Generato
         ),
         None => println!("carvers: none — no biome of this dimension names one"),
     }
+
+    // The feature stage asks two things of the running build rather than
+    // deciding them: which registry id each biome name has, and which of the
+    // palette's blocks count towards `OCEAN_FLOOR_WG` — the heightmap
+    // `OreFeature` consults before it draws a vein at all. The second comes out
+    // of the operator's own `constants.tsv` column of the same name. Without
+    // it, no feature runs, and this says so rather than guessing.
+    let ocean_floor = constants.and_then(|table| table.flag("OCEAN_FLOOR_WG"));
+    let unbound = generator.bind_features(
+        |name| names.biome(name),
+        |spec| {
+            let table = constants?;
+            let flag = ocean_floor?;
+            let state = spec_state(spec).ok()?;
+            Some(table.is_set(flag, state))
+        },
+    );
+    match generator.features() {
+        Some(features) => {
+            let (running, read) = features.coverage();
+            println!(
+                "features: {running} of {read} placed feature(s) run, {} block(s) added to the \
+                 palette, from {}",
+                features.palette().len(),
+                data.join("minecraft/worldgen/placed_feature").display()
+            );
+            if !features.ocean_floor_bound() {
+                println!(
+                    "  no feature runs: {} block(s) have no OCEAN_FLOOR_WG answer in this \
+                     checkout ({}). `cargo xtask extract --version {version} --only constants`",
+                    unbound.len(),
+                    unbound.iter().take(4).cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
+            let mut skipped: Vec<(&String, &usize)> = features.skipped().iter().collect();
+            skipped.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            let total: usize = skipped.iter().map(|(_, n)| **n).sum();
+            if total > 0 {
+                let head: Vec<String> = skipped
+                    .iter()
+                    .take(6)
+                    .map(|(kind, n)| format!("{kind} {n}"))
+                    .collect();
+                println!(
+                    "  {total} placed feature(s) this generator does not run, by kind: {}{}",
+                    head.join(", "),
+                    if skipped.len() > 6 {
+                        format!(", and {} more kind(s)", skipped.len() - 6)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+        }
+        None => println!("features: none — no biome of this dimension names one this generator runs"),
+    }
     Ok(generator)
 }
 
@@ -651,15 +724,20 @@ fn measure(options: &Options) -> Result<(), String> {
         surfaces.push(surface_of(chunk));
     }
 
-    let source = generator(&options.version, options.seed, &names)?;
-    let surface_states = match source.surface() {
-        Some(rules) => rules
-            .palette()
-            .iter()
-            .map(spec_state)
-            .collect::<Result<Vec<u32>, String>>()?,
-        None => Vec::new(),
-    };
+    let source = generator(
+        &options.version,
+        options.seed,
+        &names,
+        constants.as_ref().map(|(_, table)| table),
+    )?;
+    // One palette: the surface rules' blocks and then the features'. Resolving
+    // only the first would map an ore's material code onto whichever surface
+    // block sat at that index.
+    let surface_states = source
+        .block_palette()
+        .iter()
+        .map(spec_state)
+        .collect::<Result<Vec<u32>, String>>()?;
     let model = Model {
         flat: &flat,
         blocks: &blocks,
@@ -699,7 +777,10 @@ fn measure(options: &Options) -> Result<(), String> {
             );
         }
         report(rung, &scores);
-        if matches!(rung, Rung::Surface | Rung::Aquifers | Rung::Carve) {
+        if matches!(
+            rung,
+            Rung::Surface | Rung::Aquifers | Rung::Carve | Rung::Feature
+        ) {
             // Counted, not assumed. `minecraft:temperature` answers `false`
             // without looking and the badlands bands are the one table in the
             // rules that is not in the pack, so both are worth a number: a gap
@@ -829,13 +910,14 @@ fn build(
     let top = height.min_y() + height.height() as i32;
     if matches!(
         rung,
-        Rung::Density | Rung::Surface | Rung::Aquifers | Rung::Carve
+        Rung::Density | Rung::Surface | Rung::Aquifers | Rung::Carve | Rung::Feature
     ) {
         // The world's own floor is bedrock on every rung of this ladder,
         // including the control, because vanilla's is: the bedrock gradient is
         // true at and below the bottom without a die being rolled. What is
         // above it here is the noise stage and nothing else.
         let materials = match rung {
+            Rung::Feature => generator.features(vanilla.pos().x, vanilla.pos().z),
             Rung::Carve => generator.carve(vanilla.pos().x, vanilla.pos().z),
             Rung::Aquifers => generator.aquifer(vanilla.pos().x, vanilla.pos().z),
             Rung::Surface => generator.surface(vanilla.pos().x, vanilla.pos().z),
@@ -870,7 +952,12 @@ fn build(
                 // level everywhere; the rest take it from Minecraft, and a column
                 // Minecraft left empty gets no ground at all rather than a guess.
                 let ground = match rung {
-                    Rung::Flat | Rung::Density | Rung::Surface | Rung::Aquifers | Rung::Carve => {
+                    Rung::Flat
+                    | Rung::Density
+                    | Rung::Surface
+                    | Rung::Aquifers
+                    | Rung::Carve
+                    | Rung::Feature => {
                         unreachable!("handled above")
                     }
                     Rung::FlatAtSeaLevel | Rung::Biomes => Some(SEA_LEVEL),
@@ -885,7 +972,8 @@ fn build(
                             | Rung::Density
                             | Rung::Surface
                             | Rung::Aquifers
-                            | Rung::Carve => {
+                            | Rung::Carve
+                            | Rung::Feature => {
                                 unreachable!("handled above")
                             }
                             Rung::FlatAtSeaLevel | Rung::Biomes | Rung::Heights => {
@@ -930,7 +1018,12 @@ fn build(
         }
     } else if matches!(
         rung,
-        Rung::Biomes | Rung::Density | Rung::Surface | Rung::Aquifers | Rung::Carve
+        Rung::Biomes
+            | Rung::Density
+            | Rung::Surface
+            | Rung::Aquifers
+            | Rung::Carve
+            | Rung::Feature
     ) {
         // Quart coordinates: the cell index, which is the block position
         // shifted down by two. The x and z of the chunk are added first,
@@ -1991,7 +2084,7 @@ mod tests {
 
     #[test]
     fn the_ladder_changes_one_thing_per_rung_and_ends_at_the_control() {
-        assert_eq!(Rung::ALL.len(), 11);
+        assert_eq!(Rung::ALL.len(), 12);
         assert_eq!(Rung::ALL[0], Rung::Flat);
         assert_eq!(*Rung::ALL.last().expect("eleven"), Rung::Everything);
         assert!(!Rung::Flat.reads_the_region_file());
