@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 use dust_registry::Item;
 use dust_sim::cooking::{Cooking, Fire, FIRES};
 use dust_sim::crafting::{ItemTags, Recipes, Refusal};
+use dust_sim::cutting::Cutting;
+use dust_sim::smithing::Smithing;
 
 /// Where the recipes live inside one namespace.
 const RECIPES_UNDER: &str = "recipe";
@@ -51,9 +53,19 @@ pub struct Report {
     pub cooked_pairs: usize,
     /// A pair a later file wanted and an earlier one already held.
     pub cooked_collisions: usize,
-    /// Files whose `type` is neither made in a crafting grid nor cooked at a
-    /// fire — stonecutting, smithing. Counted apart because they are not
-    /// defects; they are recipes for blocks this server does not open yet.
+    /// Recipes a stonecutter can cut.
+    pub cut: usize,
+    /// How many (input, cut) pairs the stonecutter lookup holds.
+    pub cut_pairs: usize,
+    /// Recipes a smithing table can make.
+    pub smithed: usize,
+    /// `smithing_trim` files, which are a component this server does not
+    /// author. Counted by name rather than folded into [`Report::not_a_grid`]:
+    /// eighteen recipes at a bench a player *can* open is a different fact
+    /// from a recipe for a bench that does not exist.
+    pub trims: usize,
+    /// Files whose `type` no compiler here claims. Counted apart because they
+    /// are not defects; they are recipes this server does not run yet.
     pub not_a_grid: u32,
     /// The `crafting_special_*` markers, which are Java classes rather than
     /// described recipes. A firework, a dyed leather cap, a copied map.
@@ -79,14 +91,17 @@ impl Report {
     pub fn summary(&self) -> String {
         let mut line = format!(
             "{} recipe file(s) in {}, {} craftable in a grid, {} cooked at a fire; \
-             {} made at a block this server does not open, {} are code rather than data, \
+             {} cut at a stonecutter, {} made at a smithing table; \
+             {} not run here, {} are code rather than data, \
              {} refused; \
              {} item tag(s); index {} pair(s), {} ingredient slot(s); \
-             cooking {} pair(s){}",
+             cooking {} pair(s), cutting {} pair(s){}",
             self.files,
             self.namespaces.join(", "),
             self.compiled,
             self.cooked,
+            self.cut,
+            self.smithed,
             self.not_a_grid,
             self.special,
             self.refused,
@@ -94,6 +109,7 @@ impl Report {
             self.index_len,
             self.choice_len,
             self.cooked_pairs,
+            self.cut_pairs,
             if self.cooked_collisions == 0 {
                 String::new()
             } else {
@@ -116,17 +132,19 @@ impl Report {
 /// [`super::drops::beside`] gives: one unreadable recipe is one thing a player
 /// cannot make and a named line in the log, where refusing to boot over it is
 /// a server an operator cannot run.
-pub fn beside(root: impl AsRef<Path>) -> (Recipes, Cooking, Report) {
+pub fn beside(root: impl AsRef<Path>) -> (Recipes, Cooking, Cutting, Smithing, Report) {
     let root = root.as_ref();
     let mut recipes = Recipes::default();
     let mut cooking = Cooking::new();
+    let mut cutting = Cutting::new();
+    let mut smithing = Smithing::new();
     let mut report = Report::default();
 
     let tags = item_tags(root);
     report.tags = tags.len();
 
     let Ok(namespaces) = std::fs::read_dir(root) else {
-        return (recipes, cooking, report);
+        return (recipes, cooking, cutting, smithing, report);
     };
     let mut roots: Vec<(String, PathBuf)> = Vec::new();
     for entry in namespaces.flatten() {
@@ -162,12 +180,13 @@ pub fn beside(root: impl AsRef<Path>) -> (Recipes, Cooking, Report) {
                     continue;
                 }
             };
-            // The grid first, then the four fires. Both compilers answer
-            // `NotAGrid` for a file that is not theirs, so a file is only
-            // counted as belonging to a block this server does not open when
-            // **both** have said so — a file counted against the first
-            // compiler that shrugged at it would count every smelting recipe
-            // as unreachable on the day the furnace started reading them.
+            // The grid first, then the four fires, then the stonecutter,
+            // then the smithing table. Every compiler answers `NotAGrid` for
+            // a file that is not theirs, so a file is only counted as one
+            // this server does not run when **all four** have said so — a
+            // file counted against the first compiler that shrugged at it
+            // would count every smelting recipe as unreachable on the day the
+            // furnace started reading them.
             let refusal = match recipes.add(&id, &value, &tags) {
                 Ok(()) => continue,
                 Err(refusal) => refusal,
@@ -176,6 +195,20 @@ pub fn beside(root: impl AsRef<Path>) -> (Recipes, Cooking, Report) {
                 Refusal::NotAGrid(_) => match cooking.add(&value, &tags) {
                     Ok(()) => continue,
                     Err(second) => second,
+                },
+                first => first,
+            };
+            let refusal = match refusal {
+                Refusal::NotAGrid(_) => match cutting.add(&value, &tags) {
+                    Ok(()) => continue,
+                    Err(third) => third,
+                },
+                first => first,
+            };
+            let refusal = match refusal {
+                Refusal::NotAGrid(_) => match smithing.add(&value, &tags) {
+                    Ok(()) => continue,
+                    Err(fourth) => fourth,
                 },
                 first => first,
             };
@@ -191,13 +224,18 @@ pub fn beside(root: impl AsRef<Path>) -> (Recipes, Cooking, Report) {
     }
 
     recipes.index();
+    cutting.index();
     report.compiled = recipes.len();
     report.index_len = recipes.index_len();
     report.choice_len = recipes.choice_len();
     report.cooked = cooking.len();
     report.cooked_pairs = cooking.pairs();
     report.cooked_collisions = cooking.collisions();
-    (recipes, cooking, report)
+    report.cut = cutting.len();
+    report.cut_pairs = cutting.pairs();
+    report.smithed = smithing.len();
+    report.trims = smithing.trims();
+    (recipes, cooking, cutting, smithing, report)
 }
 
 /// How many pairs each fire cooks, for the boot line and for a check that one
@@ -370,6 +408,110 @@ fn namespaced(name: &str) -> String {
     } else {
         format!("minecraft:{name}")
     }
+}
+
+/// The recipes a client has to be told about, as one already-encoded packet.
+///
+/// # Why the client needs any of them
+///
+/// Dust matches every recipe on the server, so for a crafting table, a furnace
+/// and a smithing table the client needs nothing: it is shown what the slots
+/// hold and it draws that. A **stonecutter is different**. Its buttons are
+/// drawn by the client out of its own recipe list, filtered by whatever is in
+/// the input slot, and the packet it sends back names a button by its position
+/// in that list. A client that was told no recipes draws no buttons, and the
+/// screen is a dead end.
+///
+/// # And why not all 1,290
+///
+/// Vanilla declares everything, which is about 100 kB per join on 1.21.1. The
+/// only thing that changes for a player is the recipe *book*, which needs a
+/// second packet Dust does not send and which is not reachable from anything
+/// this server opens. So this declares the 250 stonecutting recipes and the
+/// nine smithing transforms — the screens whose contents the client computes —
+/// and nothing else. Decision record 0044.
+///
+/// The smithing nine are in for a reason of their own: the vanilla client
+/// recomputes a smithing table's result whenever an input slot changes and
+/// **clears its own result slot** when nothing matches. A client with no
+/// smithing recipes would blank a result the server had just sent.
+///
+/// Built once at boot and cloned per join, which is one allocation and a
+/// memcpy of a few kilobytes rather than several thousand small ones.
+///
+/// # Errors
+///
+/// The encoding fails only if the packet does not exist at this version.
+pub fn declaration(
+    cutting: &Cutting,
+    smithing: &Smithing,
+    version: dust_protocol::ProtocolVersion,
+) -> Option<dust_net::frame::Frame> {
+    use dust_protocol::packets::play::containers::{
+        Ingredient, Recipe, RecipeKind, SmithingTransformData, StonecuttingData,
+    };
+    use dust_protocol::types::{Identifier, ProtocolString, Slot};
+
+    let stack = |item: dust_registry::Item, count: u8| Slot::Present {
+        count: i32::from(count),
+        item_id: item.protocol_id() as i32,
+        components: dust_protocol::components::ComponentPatch::EMPTY,
+    };
+    let one = |items: Vec<dust_registry::Item>| Ingredient {
+        items: items.into_iter().map(|item| stack(item, 1)).collect(),
+    };
+
+    let mut recipes = Vec::new();
+    // The id is a name the client uses only to tell two recipes apart, and
+    // Dust does not keep the file's own. A stable synthetic one is enough and
+    // is not Mojang's data: `dust:cut/<n>`.
+    for (index, input) in dust_registry::Item::all().enumerate() {
+        let cuts = cutting.cuts_of(input);
+        if cuts.is_empty() {
+            continue;
+        }
+        for (which, cut) in cuts.iter().enumerate() {
+            let (item, count) = cut.result();
+            recipes.push(Recipe {
+                id: Identifier::parse(&format!("dust:cut/{index}/{which}")).ok()?,
+                kind: RecipeKind::Stonecutting(StonecuttingData {
+                    group: ProtocolString::new(String::new()).ok()?,
+                    ingredient: one(vec![input]),
+                    result: stack(item, count),
+                }),
+            });
+        }
+    }
+    for (index, transform) in smithing.iter().enumerate() {
+        let (item, count) = transform.result();
+        recipes.push(Recipe {
+            id: Identifier::parse(&format!("dust:smith/{index}")).ok()?,
+            kind: RecipeKind::SmithingTransform(SmithingTransformData {
+                group: ProtocolString::new(String::new()).ok()?,
+                template: one(transform.template_items().collect()),
+                base: one(transform.base_items().collect()),
+                addition: one(transform.addition_items().collect()),
+                result: stack(item, count),
+            }),
+        });
+    }
+
+    // Nothing to declare is not an empty declaration. A client that receives
+    // no recipes and a client that receives a list of none are in the same
+    // state, so the second is a packet for nobody — and a server with no
+    // `[data] path` is the ordinary case, not an unusual one.
+    if recipes.is_empty() {
+        return None;
+    }
+    let packet = dust_protocol::packets::play::clientbound::Packet::UpdateRecipes(
+        dust_protocol::packets::play::clientbound::UpdateRecipes { recipes },
+    );
+    let mut body = dust_protocol::wire::Writer::default();
+    packet.encode_body(&mut body, version).ok()?;
+    Some(dust_net::frame::Frame::new(
+        packet.protocol_id(version).ok()? as i32,
+        body.into_bytes(),
+    ))
 }
 
 #[cfg(test)]

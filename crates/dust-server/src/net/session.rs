@@ -180,6 +180,20 @@ pub struct SessionContext {
     /// What the four fires cook. Same road as the recipes, same file, same
     /// share.
     pub cooking: Arc<dust_sim::cooking::Cooking>,
+    /// What a stonecutter cuts, **in the order the buttons are drawn**. The
+    /// order is not a detail: the packet the client sends back names a recipe
+    /// by its position in this list. See `dust_sim::cutting`.
+    pub cutting: Arc<dust_sim::cutting::Cutting>,
+    /// The recipes a client is told about at join, already encoded.
+    ///
+    /// One frame built at boot and cloned per join. See
+    /// `registries::recipes::declaration` for which recipes are in it and why
+    /// the rest are not. `None` on a server with no `[data] path`, and then
+    /// nothing is sent — a client told about no recipes draws a stonecutter
+    /// with no buttons, which is the honest picture of a server that has none.
+    pub declared_recipes: Option<dust_net::frame::Frame>,
+    /// What a smithing table upgrades. Same road, same file, same share.
+    pub smithing: Arc<dust_sim::smithing::Smithing>,
     /// Every furnace in the world. Not a per-session thing at all: the same
     /// `Arc` the tick loop holds, because a furnace goes on burning after the
     /// session that lit it has gone.
@@ -1027,7 +1041,9 @@ where
             carried.map_or(0, |carried| carried.experience),
         )
     };
-    let mut inventory = inventory.crafting_with(Arc::clone(&ctx.recipes));
+    let mut inventory = inventory
+        .crafting_with(Arc::clone(&ctx.recipes))
+        .at_benches(Arc::clone(&ctx.cutting), Arc::clone(&ctx.smithing));
     if let Some(items) = ctx.item_blocks.clone() {
         inventory = inventory.burning_with(items, Arc::clone(&ctx.cooking));
     }
@@ -1051,6 +1067,16 @@ where
     // tick, so the flame comes down and the arrow crosses; without it the bars
     // would move once per ingot.
     let mut watching: Option<super::furnaces::Watch> = None;
+
+    // The recipes the client has to compute a screen from, before any screen
+    // can be opened. A stonecutter's buttons are drawn by the client out of
+    // this list and there is no second chance to send it: the client filters
+    // whatever it has when the input slot changes, so a declaration that
+    // arrived after the screen would be a screen with no buttons until it was
+    // closed and reopened.
+    if let Some(frame) = ctx.declared_recipes.clone() {
+        conn.send(frame).await?;
+    }
 
     // And told to the client, all forty-six slots at once. This is the one
     // place the whole container goes out: a join has nothing to compare
@@ -1996,7 +2022,30 @@ where
                             drop(watching.replace(ctx.furnaces.watch(use_on.hit.location)));
                             open_furnace(conn, ctx, &mut inventory, screen, fire).await?;
                         }
-                        let opens = opens || fire.is_some();
+                        // The two benches, on the same road the furnace
+                        // takes and read in the same breath: a block is a
+                        // fire, a bench or neither, never two of them.
+                        let bench = reachable.then(|| bench_at(there)).flatten();
+                        if let Some(bench) = bench {
+                            if screen.id != PLAYER_WINDOW {
+                                inventory.closed(screen.window);
+                            }
+                            inventory.clear_furnace_mirror();
+                            drop(watching.take());
+                            next_window = if next_window >= LAST_CONTAINER_WINDOW {
+                                FIRST_CONTAINER_WINDOW
+                            } else {
+                                next_window + 1
+                            };
+                            screen = Screen {
+                                id: next_window,
+                                window: bench,
+                                at: Some(use_on.hit.location),
+                            };
+                            inventory.at_fire(None);
+                            open_bench(conn, ctx, &mut inventory, screen).await?;
+                        }
+                        let opens = opens || fire.is_some() || bench.is_some();
                         if crafting_table().is_some_and(|table| there == table) && reachable {
                             if let Some(menu) = crafting_menu() {
                                 // A window the player had open is closed
@@ -2195,6 +2244,32 @@ where
                                 push_back(conn, ctx, &mut inventory, screen, changed, &click)
                                     .await?;
                             }
+                        }
+                    }
+                    // A screen's button: a stonecutter's recipe row is the
+                    // only one this server draws. The id is a *position in a
+                    // list the client built*, not a recipe, which is why
+                    // `dust_sim::cutting` sorts — see decision record 0037.
+                    Ok(play::serverbound::Packet::ClickContainerButton(press)) => {
+                        if press.window_id.0 == i32::from(screen.id)
+                            && screen.window == Window::Stonecutter
+                        {
+                            let changed = inventory.choose_cut(press.button_id.0);
+                            if !changed.is_empty() {
+                                record_inventory(
+                                    ctx,
+                                    profile_id,
+                                    me.entity_id,
+                                    &inventory,
+                                    experience,
+                                );
+                                send_changed(conn, ctx, &mut inventory, screen, changed).await?;
+                            }
+                            // The highlight, always — a press the server
+                            // ignored still has to leave the client's idea of
+                            // which row is lit equal to the server's, or the
+                            // two disagree silently for the rest of the screen.
+                            send_cut_selection(conn, ctx, screen, &inventory).await?;
                         }
                     }
                     // The player closed their own inventory. Whatever was on
@@ -2628,6 +2703,21 @@ impl Screen {
     }
 }
 
+/// Which bench this block is, if it is one.
+///
+/// A table of two, read out of the block registry rather than matched on a
+/// name at the call site, so that a build whose registry does not have one of
+/// them opens nothing rather than opening the wrong screen.
+fn bench_at(there: dust_registry::Block) -> Option<Window> {
+    if dust_registry::Block::from_name("minecraft:stonecutter") == Some(there) {
+        return Some(Window::Stonecutter);
+    }
+    if dust_registry::Block::from_name("minecraft:smithing_table") == Some(there) {
+        return Some(Window::Smithing);
+    }
+    None
+}
+
 /// The block a right-click opens a crafting table for.
 fn crafting_table() -> Option<dust_registry::Block> {
     dust_registry::Block::from_name("minecraft:crafting_table")
@@ -2698,6 +2788,94 @@ where
         ctx.version,
     )
     .await
+}
+
+/// Send every slot a change touched, and the cursor if it moved.
+///
+/// The half of [`push_back`] that does not need a click to compare against —
+/// what a button press produces, where there is nothing the client predicted.
+async fn send_changed<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    inventory: &mut super::inventory::Inventory,
+    screen: Screen,
+    changed: super::inventory::Changed,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    for index in changed.iter() {
+        send_slot(conn, ctx, inventory, screen, index).await?;
+    }
+    Ok(())
+}
+
+/// Which of a stonecutter's rows is lit.
+///
+/// `StonecutterMenu.selectedRecipeIndex`, property 0, and `-1` for none. The
+/// client draws the highlight from it and nothing else; a server that filled
+/// the result slot and never sent this would hand the player the right block
+/// under a screen that says they chose nothing.
+async fn send_cut_selection<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    screen: Screen,
+    inventory: &super::inventory::Inventory,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    send_play(
+        conn,
+        play::clientbound::ContainerSetData {
+            window_id: screen.id,
+            property: 0,
+            value: inventory.cut_choice() as i16,
+        },
+        ctx.version,
+    )
+    .await
+}
+
+/// Open a stonecutter's or a smithing table's screen and state what is in it.
+async fn open_bench<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    inventory: &mut super::inventory::Inventory,
+    screen: Screen,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (name, title, fallback) = match screen.window {
+        Window::Stonecutter => (
+            "minecraft:stonecutter",
+            "container.stonecutter",
+            "Stonecutter",
+        ),
+        Window::Smithing => ("minecraft:smithing", "container.upgrade", "Upgrade Gear"),
+        _ => return Ok(()),
+    };
+    let Some(menu) =
+        dust_registry::Registry::from_name("minecraft:menu").and_then(|reg| reg.entry_id(name))
+    else {
+        return Ok(());
+    };
+    send_play(
+        conn,
+        play::clientbound::OpenScreen {
+            window_id: screen.id,
+            menu_kind: VarInt(menu as i32),
+            title: dust_protocol::text::Component::translate(title, Some(fallback.to_owned())),
+        },
+        ctx.version,
+    )
+    .await?;
+    send_container(conn, ctx, inventory, screen).await?;
+    if screen.window == Window::Stonecutter {
+        send_cut_selection(conn, ctx, screen, inventory).await?;
+    }
+    Ok(())
 }
 
 /// Send one slot.

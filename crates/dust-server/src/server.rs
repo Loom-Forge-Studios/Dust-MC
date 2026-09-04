@@ -1024,15 +1024,18 @@ impl Server {
 
         // And the fourth: what a grid of items makes, and what a fire turns
         // one item into. Same directory, same argument, decision record 0033.
-        let (recipes, cooking, recipes_report) = match data_path.as_deref() {
+        let (recipes, cooking, cutting, smithing, recipes_report) = match data_path.as_deref() {
             None => (
                 dust_sim::crafting::Recipes::default(),
                 dust_sim::cooking::Cooking::new(),
+                dust_sim::cutting::Cutting::new(),
+                dust_sim::smithing::Smithing::new(),
                 None,
             ),
             Some(path) => {
-                let (recipes, cooking, report) = crate::registries::recipes::beside(path);
-                (recipes, cooking, Some(report))
+                let (recipes, cooking, cutting, smithing, report) =
+                    crate::registries::recipes::beside(path);
+                (recipes, cooking, cutting, smithing, Some(report))
             }
         };
         match &recipes_report {
@@ -1059,6 +1062,8 @@ impl Server {
         }
         let recipes = std::sync::Arc::new(recipes);
         let cooking = std::sync::Arc::new(cooking);
+        let cutting = std::sync::Arc::new(cutting);
+        let smithing = std::sync::Arc::new(smithing);
         let items: std::sync::Arc<crate::net::items::ItemWorld> = std::sync::Arc::default();
         let falling: std::sync::Arc<crate::net::falling::FallingWorld> = std::sync::Arc::default();
 
@@ -1383,6 +1388,9 @@ impl Server {
             drops: std::sync::Arc::clone(&drops),
             recipes: std::sync::Arc::clone(&recipes),
             cooking: std::sync::Arc::clone(&cooking),
+            declared_recipes: crate::registries::recipes::declaration(&cutting, &smithing, version),
+            cutting: std::sync::Arc::clone(&cutting),
+            smithing: std::sync::Arc::clone(&smithing),
             furnaces: std::sync::Arc::clone(&furnaces),
             item_entity_type: crate::net::play::item_entity_type().ok_or_else(|| {
                 fail("the generated entity table has no minecraft:item".to_owned())
