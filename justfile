@@ -121,6 +121,26 @@ break port="25565":
 collide port="25565":
     cd tools/bot && node collide.js {{port}}
 
+# Whether the sun actually moves, asked of a running server.
+#
+#   just daylight 25565
+#   node daylight.js <port> --report     print the readings, assert nothing
+#
+# A bot watches `update_time` for four seconds and checks that the sun climbs
+# at twenty ticks a second and arrives once a second rather than once a tick;
+# runs every arm of `/time` and reads the answers back; and then joins a
+# *second* bot into the world it has just moved to dusk, which is the check the
+# whole thing exists for — a player joining mid-evening has to arrive
+# mid-evening, and the first `update_time` they are sent is what decides it.
+#
+# What it cannot check is a restart, because it does not own the server: stop
+# the server, look at `world/dust-edits.json` and the world's `level.dat`, and
+# start it again. Decision record 0044 is the account.
+#
+# Outside `verify` for the same reason `bot` is.
+daylight port="25565":
+    cd tools/bot && node daylight.js {{port}}
+
 # What four people joining at once does to somebody already standing there.
 #
 #   just join 25565 4          four joiners, one process each

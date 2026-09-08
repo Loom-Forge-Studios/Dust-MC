@@ -41,7 +41,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 pub mod chat;
 pub mod collide;
+pub mod commands;
 pub mod configure;
+pub mod daylight;
 pub mod edits;
 pub mod falling;
 pub mod favicon;

@@ -12,7 +12,7 @@ use crate::packets::play::chat::MessageAcknowledgement;
 use crate::packets::play::containers::{ChangedSlot, ClickType, RecipeBookType};
 use crate::packets::play::map_item::BookPage;
 use crate::packets::play::{Abilities, DifficultyByte, Hand};
-use crate::types::{BoundedString, Identifier, RestOfPacket, Slot, VarInt};
+use crate::types::{BoundedString, Identifier, ProtocolString, RestOfPacket, Slot, VarInt};
 use crate::{packet_group, var_int_enum};
 
 packet_group! {
@@ -39,6 +39,28 @@ packet_group! {
         salt: i64,
         signature: Option<crate::packets::play::chat::SignatureBytes>,
         acknowledgement: MessageAcknowledgement,
+    },
+
+    /// A command the player typed, unsigned: the whole packet is the text
+    /// after the slash, with no leading slash of its own.
+    ///
+    /// **This one carries no signing artifacts at all, and that is the
+    /// version's doing rather than a simplification here.** Before 1.20.5 a
+    /// command travelled with a timestamp, a salt and one signature per
+    /// signable argument; 1.20.5 split that packet in two and left this half
+    /// holding a bare string. A client attaches signatures only when the
+    /// command it is running has an argument the server declared as
+    /// `minecraft:message` — `/say`, `/msg`, `/me` — and sends
+    /// `chat_command_signed` in that case instead. Every other command a
+    /// vanilla client runs arrives here.
+    ///
+    /// So the string is bounded at the protocol default rather than at chat's
+    /// 256: the vanilla chat box will not let anyone type more than 256, but
+    /// the packet does not say so, and a decoder that refuses what the format
+    /// permits disconnects a client instead of answering it. A command too
+    /// long to mean anything is a thing to reply to, not to drop a player for.
+    "minecraft:chat_command" => ChatCommand {
+        command: ProtocolString,
     },
 
     /// A plugin channel message toward the server.

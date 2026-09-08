@@ -444,6 +444,18 @@ pub fn parser_by_id(id: i32) -> Option<&'static ParserDef> {
     PARSERS.iter().find(|parser| parser.id == id)
 }
 
+/// Look up a parser definition by its namespaced name.
+///
+/// The direction a *builder* needs. Minecraft's own command report names
+/// parsers — `minecraft:time`, `brigadier:integer` — and the wire carries
+/// their ids, so anything turning that report into a packet has to cross this
+/// table in the opposite direction from the decoder. Writing the id out by
+/// hand at the call site is the alternative and is exactly the transcription
+/// mistake the table above exists to keep in one place.
+pub fn parser_by_name(name: &str) -> Option<&'static ParserDef> {
+    PARSERS.iter().find(|parser| parser.name == name)
+}
+
 impl ParserProperties {
     fn decode_for<R: WireRead + ?Sized>(
         parser_id: i32,
@@ -473,7 +485,15 @@ impl ParserProperties {
                 Ok(Self::String(mode))
             }
             6 => Ok(Self::Entity(input.read_u8()?)),
-            31 => Ok(Self::ScoreHolder(input.read_u8()?)),
+            // 30, not 31. `minecraft:score_holder` sits immediately after
+            // `minecraft:scoreboard_slot` in vanilla's registration order, and
+            // 31 is `minecraft:swizzle`, which takes no properties at all — so
+            // this arm used to be unreachable and every real `/scoreboard` or
+            // `/trigger` node in a vanilla `commands` packet was refused as
+            // "known but not modelled". The test below pins each of these arms
+            // against [`PARSERS`] by name, which is the only reason the number
+            // and the table cannot drift apart again.
+            30 => Ok(Self::ScoreHolder(input.read_u8()?)),
             42 => Ok(Self::Time(input.read_i32()?)),
             43..=46 => Ok(Self::Registry(Identifier::decode(input, version)?)),
             other => Err(DecodeError::Unsupported {
@@ -498,9 +518,17 @@ impl ParserProperties {
         // The pairing this asserts is checked by the caller: `Node`'s encoder
         // refuses a properties/no-properties mismatch before reaching here, so
         // in debug builds writing under an id that takes none is a bug of ours.
+        //
+        // Asked of [`PARSERS`] rather than of a literal id list, and that is
+        // the fix rather than the style: the list used to be written out here
+        // as `1..=6 | 31 | 42..=46`, and `minecraft:score_holder` is id **30**.
+        // So every debug build that encoded a score-holder argument's property
+        // block — `/scoreboard players set`, `/trigger` — tripped an assertion
+        // about code that was correct. A guard with its own copy of the table
+        // it guards is a guard that can disagree with it.
         debug_assert!(
-            matches!(parser_id, 1..=6 | 31 | 42..=46),
-            "properties written under a parser id that takes none"
+            parser_by_id(parser_id).is_some_and(|def| def.has_properties),
+            "properties written under a parser id that takes none: {parser_id}"
         );
         match self {
             Self::Float(range) => range.encode_range(out, |out, value| out.write_f32(value)),
@@ -744,6 +772,45 @@ mod tests {
         for (position, parser) in PARSERS.iter().enumerate() {
             assert_eq!(parser.id, position as i32, "{}", parser.name);
         }
+    }
+
+    #[test]
+    fn every_property_shape_is_decoded_under_the_id_the_table_gives_it() {
+        // Each arm of `decode_for` is a number written next to a shape, and a
+        // number written by hand beside a table that already holds it is a
+        // number that can be wrong — `minecraft:score_holder` was decoded
+        // under 31 for the whole life of this file, where the table says 30.
+        // This asks the table for each one.
+        for (name, expected) in [
+            ("brigadier:float", 1),
+            ("brigadier:double", 2),
+            ("brigadier:integer", 3),
+            ("brigadier:long", 4),
+            ("brigadier:string", 5),
+            ("minecraft:entity", 6),
+            ("minecraft:score_holder", 30),
+            ("minecraft:time", 42),
+            ("minecraft:resource_or_tag", 43),
+            ("minecraft:resource_or_tag_key", 44),
+            ("minecraft:resource", 45),
+            ("minecraft:resource_key", 46),
+        ] {
+            let def = parser_by_name(name).expect("in the table");
+            assert_eq!(def.id, expected, "{name}");
+            assert!(def.has_properties, "{name}");
+        }
+        // And the converse: every parser the table says carries properties has
+        // an arm above, so a thirteenth would fail here rather than at a
+        // client.
+        let with_properties: Vec<i32> = PARSERS
+            .iter()
+            .filter(|parser| parser.has_properties)
+            .map(|parser| parser.id)
+            .collect();
+        assert_eq!(
+            with_properties,
+            vec![1, 2, 3, 4, 5, 6, 30, 42, 43, 44, 45, 46]
+        );
     }
 
     #[test]

@@ -853,13 +853,49 @@ fn an_offline_login_runs_the_whole_configuration_exchange_and_reaches_play() {
     assert_ne!(body[0] & 0x04, 0, "ALLOW_FLYING, or creative mode walks");
     assert_ne!(body[0] & 0x01, 0, "and invulnerable, as creative is");
 
+    // The clock, and a **positive** time of day, which is what tells a client
+    // the cycle runs. It used to be negative here — the protocol's way of
+    // saying the sun is frozen — because nothing ticked a clock and every
+    // player who ever joined Dust stood in a permanent midday. A world that
+    // has never been played opens at dawn, tick 1,000, which is where
+    // Minecraft opens a new one.
     let (id, body) = recv_compressed_frame(&mut stream);
     assert_eq!(id, 100, "set_time");
+    let world_age = i64::from_be_bytes(body[0..8].try_into().expect("eight bytes"));
     let time_of_day = i64::from_be_bytes(body[8..16].try_into().expect("eight bytes"));
     assert!(
-        time_of_day < 0,
-        "a negative time_of_day is what freezes the cycle; a positive one \
-         would start the sun moving on a server whose clock does not tick"
+        time_of_day > 0,
+        "a negative time_of_day tells the client the cycle is frozen, which is \
+         what this server used to say and no longer means: {time_of_day}"
+    );
+    // How far past dawn depends on how long this server has been up, and this
+    // one is driven by a clock the harness winds, so the number is not
+    // predictable. What *is* exact is the relationship: a fresh world starts
+    // at game time 0 and day time 1,000, and with the cycle running both
+    // advance together for ever. So the gap is the world's opening hour and
+    // nothing else, whatever either number reached.
+    assert_eq!(
+        time_of_day - world_age,
+        1_000,
+        "a fresh world opens at dawn and the two clocks then move as one: \
+         age {world_age}, sun {time_of_day}"
+    );
+    assert!(
+        world_age > 0,
+        "and the world has actually run some ticks by now, so the clock is \
+         being moved rather than merely initialised: {world_age}"
+    );
+
+    // What may be typed after a slash. Without it a client's tab completion
+    // offers nothing and its parser calls every command unknown, so a `/time`
+    // that the server would happily run looks broken while it is being typed.
+    let (id, body) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 17, "commands");
+    let (nodes, _) = read_var_int_from(&body);
+    assert_eq!(nodes, 14, "the root and the whole of the /time subtree");
+    assert!(
+        String::from_utf8_lossy(&body).contains("midnight"),
+        "and the literals a client completes against are in it"
     );
 
     let (id, _) = recv_compressed_frame(&mut stream);

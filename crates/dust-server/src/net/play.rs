@@ -740,22 +740,14 @@ pub fn full_health() -> play::clientbound::SetHealth {
     }
 }
 
-/// The world clock.
-///
-/// Two numbers, and they mean different things. `world_age` only ever counts
-/// up and is what scoreboards and some redstone read; `time_of_day` is the
-/// position of the sun within a 24,000-tick day. A **negative** `time_of_day`
-/// tells the client the cycle is frozen at its absolute value, which is what
-/// this server sends: nothing here ticks a clock, and a sun that never moves is
-/// better than one that jumps back to dawn every time somebody joins.
-pub fn frozen_at_noon() -> play::clientbound::SetTime {
-    /// Midday, when a superflat looks like anything at all.
-    const NOON: i64 = 6_000;
-    play::clientbound::SetTime {
-        world_age: 0,
-        time_of_day: -NOON,
-    }
-}
+// The world clock used to be here, as `frozen_at_noon`: a `SetTime` with a
+// world age of zero and a negative time of day, which is the protocol's way of
+// saying the cycle is stopped. It was honest — nothing ticked a clock — and it
+// meant every player who ever joined Dust stood in a permanent midday.
+//
+// The clock is now [`crate::net::daylight::WorldClock`], which is shared with
+// the tick loop and builds its own packet: a constant here could only ever be
+// a constant, and what a session needs to send is a reading.
 
 #[cfg(test)]
 mod tests {

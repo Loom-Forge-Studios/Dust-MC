@@ -834,3 +834,33 @@ reach a player, 8 cells of air to 1,738.
 
 A carver fills a cave with `minecraft:cave_air` and not `minecraft:air`, which
 is why the count asks about three names and not one.
+
+## `daylight.js`
+
+`daylight.js` watches the sky. It records every `update_time` packet with the
+moment it arrived, which is the pair of questions no in-process test can ask:
+whether the sun climbs at twenty ticks a second, and whether it is being
+*told* once a second rather than once a tick.
+
+```sh
+node daylight.js 25599            # the gate
+node daylight.js 25599 --report   # the readings, asserting nothing
+```
+
+Then it runs every arm of `/time` through mineflayer's `chat_command` — which
+is written from prismarine's own reading of the protocol and had never been
+sent to this server before, because `minecraft:chat_command` was on
+`dust-protocol`'s blocked list until decision record 0044 — and reads the
+answers out of chat.
+
+**The last two checks are the ones it exists for.** A second bot joins a world
+the first one has just moved to dusk, and the very first `update_time` it is
+sent has to be the world's own time. A client draws whatever it is told first,
+so a join that says noon is a sky that visibly snaps a second later — which is
+precisely the server every player met before there was a clock at all.
+
+What it cannot check is a restart: it does not own the server. That half is
+done by hand, and decision record 0044 records what it found — a world served
+for a while, stopped, and started again resumes at the tick it left, out of
+`world/dust-edits.json`, and out of the world's own `level.dat` when the Dust
+save is deleted.

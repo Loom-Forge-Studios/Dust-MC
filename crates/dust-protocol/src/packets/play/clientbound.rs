@@ -273,8 +273,10 @@ packet_group! {
     /// Every command the server offers, as a brigadier node graph.
     ///
     /// Children and redirects are indices into the packet's own node array,
-    /// and may only point at nodes declared earlier; see [`CommandsBody`]'s
-    /// module for the node format and the parser table.
+    /// and may point **either way** through it: vanilla writes the root first
+    /// and every one of its children after it, so forward references are the
+    /// normal case and a reader has to resolve in a second pass. See
+    /// [`CommandsBody`]'s module for the node format and the parser table.
     "minecraft:commands" => Commands {
         body: CommandsBody,
     },

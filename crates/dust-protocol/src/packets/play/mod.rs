@@ -2,14 +2,13 @@
 //!
 //! # Where this state stands
 //!
-//! Every packet this version's table lists is defined here except six, and
-//! those six are blocked rather than skipped. Each carries one of two walls,
+//! Every packet this version's table lists is defined here except five, and
+//! those five are blocked rather than skipped. Each carries one of two walls,
 //! named so nobody has to rediscover which one applies:
 //!
 //! | Packet | Direction | Blocker |
 //! | --- | --- | --- |
 //! | `minecraft:delete_chat` | clientbound | **Chat signing** — removes messages by signature digest |
-//! | `minecraft:chat_command` | serverbound | **Chat signing** — unsigned commands still ride the signed-chat envelope |
 //! | `minecraft:chat_command_signed` | serverbound | **Chat signing** — argument signatures and acknowledgements |
 //! | `minecraft:chat_session_update` | serverbound | **Chat signing** — session keys this crate never verifies |
 //! | `minecraft:debug_sample` | clientbound | **Dev-only** — F3 debug samples; the vanilla server gates them on operator status |
@@ -18,6 +17,21 @@
 //! The signing wall is [`chat`]'s: Dust is offline-first, and the day online
 //! mode arrives, the layouts there are where verification plugs in. The dev
 //! pair is a pair because neither half means anything alone.
+//!
+//! # `chat_command` was on that list and never belonged on it
+//!
+//! It sat under the signing wall on the reasoning that "unsigned commands
+//! still ride the signed-chat envelope". That was true of 1.20.4 and stopped
+//! being true in 1.20.5, which split the packet in two: `chat_command_signed`
+//! kept the timestamp, the salt, the per-argument signatures and the
+//! acknowledgement chain, and `chat_command` was left holding **a single
+//! string and nothing else**. A client sends the signed half only for a
+//! command with an argument the server declared as `minecraft:message`;
+//! everything else — `/time`, `/gamemode`, `/give` — arrives unsigned.
+//!
+//! Confirmed against `minecraft-data`, which is a separate implementation of
+//! this protocol and describes the same one-field container. The wall that
+//! remains is real and is the signed half's.
 //!
 //! # The Slot wall was never a clientbound wall
 //!

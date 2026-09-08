@@ -184,6 +184,22 @@ pub struct SessionContext {
     /// `Arc` the tick loop holds, because a furnace goes on burning after the
     /// session that lit it has gone.
     pub furnaces: Arc<super::furnaces::Furnaces>,
+    /// The world's clock, shared with the tick loop that moves it.
+    ///
+    /// Read three ways by a session and written by none: once on join, so a
+    /// player who arrives at dusk arrives at dusk; once a second, so their
+    /// client's own sky clock is corrected before it drifts; and once a tick,
+    /// as a single relaxed load of [`WorldClock::epoch`](super::daylight::WorldClock::epoch),
+    /// so that a `/time set` is on screen the same tick it was typed.
+    pub clock: Arc<super::daylight::WorldClock>,
+    /// The command graph every joining player is sent, built once at boot.
+    ///
+    /// Built once because it cannot change while the server runs — it is a
+    /// subgraph of a generated table — and because building it allocates a
+    /// node per command node. Sending it is what makes a real client's tab
+    /// completion and argument parsing work at all; see
+    /// [`super::commands::declaration`].
+    pub commands: Arc<dust_protocol::packets::play::clientbound::Commands>,
     /// Minecraft's own per-state constants, if the operator put a table beside
     /// their data.
     ///
@@ -620,7 +636,16 @@ where
     // the server is about to run against.
     let creative = ctx.game_mode == dust_config::model::GameMode::Creative;
     send_play(conn, play_mod::abilities(creative), version).await?;
-    send_play(conn, play_mod::frozen_at_noon(), version).await?;
+    // The clock as it stands *now*, not a constant. A player joining at dusk
+    // has to arrive at dusk: the client runs its own sky between the packets
+    // it is sent, so whatever it is told here is what it draws for the next
+    // second, and being told noon on join is a sun that visibly snaps.
+    send_play(conn, ctx.clock.packet(), version).await?;
+    // What this server will accept after a slash. Sent in the join burst
+    // rather than lazily because a client builds its command tree once, on
+    // receipt, and a client that has not been told anything treats every
+    // command as unknown while it types.
+    send_play(conn, (*ctx.commands).clone(), version).await?;
     send_play(conn, play_mod::default_spawn(spawn), version).await?;
 
     // Before the chunks, not after: a client uses its position to decide which
@@ -1155,8 +1180,34 @@ where
     // changes happen only where somebody is smelting; a channel per furnace
     // would be a channel per block.
     let mut furnace_changes = ctx.furnaces.subscribe();
+    // The sky, once a second. Vanilla's own rate — `tickCount % 20 == 0` — and
+    // the reason it is affordable is that the client is not waiting on it: it
+    // advances its own sun between packets and this corrects the drift. One
+    // 18-byte packet per player per second — 1.8 kB/s of upload across a
+    // hundred players, measured in `benches/daylight.rs` — which is why there
+    // is nothing here worth making cheaper.
+    //
+    // Starting one whole period from now rather than immediately, unlike the
+    // keep-alive beside it: the join burst has just sent this client the
+    // clock, and an `interval` whose first tick fires at once would send it
+    // again in the same millisecond.
+    let mut sky = tokio::time::interval_at(
+        tokio::time::Instant::now() + super::daylight::BROADCAST_PERIOD,
+        super::daylight::BROADCAST_PERIOD,
+    );
+    // What this session last saw of the clock's epoch. A `/time set` bumps it,
+    // and the arm below notices within a tick rather than within a second.
+    let mut clock_epoch = ctx.clock.epoch();
     loop {
         tokio::select! {
+            _ = sky.tick() => {
+                send_play(conn, ctx.clock.packet(), ctx.version).await?;
+                // Recorded here as well as in the arm that watches for it: a
+                // command that landed in the same second has just been sent
+                // anyway, and telling this player twice would be two packets
+                // saying the same thing.
+                clock_epoch = ctx.clock.epoch();
+            }
             _ = streaming.tick() => {
                 stream_up_to(
                     conn,
@@ -1178,6 +1229,16 @@ where
                 next_id = next_id.wrapping_add(1);
             }
             _ = pickups.tick() => {
+                // The clock, if a command moved it. One relaxed atomic load
+                // per player per tick, and it buys the difference between
+                // `/time set midnight` being instant and being *up to a
+                // second* late — which is what vanilla is, because vanilla has
+                // no per-tick arm to hang this on and Dust does.
+                let epoch = ctx.clock.epoch();
+                if epoch != clock_epoch {
+                    clock_epoch = epoch;
+                    send_play(conn, ctx.clock.packet(), ctx.version).await?;
+                }
                 // A break whose stop came in too early finishes here, on the
                 // server's own count. This arm already runs once a tick for
                 // the pickups, so the whole cost of the delayed path is one
@@ -1736,6 +1797,30 @@ where
                                 .await?;
                             }
                         }
+                    }
+                    // A command, unsigned — which since 1.20.5 is every
+                    // command whose arguments the server did not declare as
+                    // `minecraft:message`, so every command Dust has.
+                    //
+                    // The reply goes to the player who typed it and to nobody
+                    // else, which is vanilla's behaviour with
+                    // `sendCommandFeedback` on and no operators to broadcast
+                    // to. What everybody *does* see is the sky move, and that
+                    // travels on the clock rather than in a chat line.
+                    Ok(play::serverbound::Packet::ChatCommand(typed)) => {
+                        let said = match super::commands::Command::parse(typed.command.as_str()) {
+                            Ok(command) => command.run(&ctx.clock),
+                            Err(why) => super::commands::refusal(&why),
+                        };
+                        send_play(
+                            conn,
+                            play::clientbound::SystemChat {
+                                content: said,
+                                overlay: false,
+                            },
+                            ctx.version,
+                        )
+                        .await?;
                     }
                     Ok(play::serverbound::Packet::Chat(said)) => {
                         // The signature and the acknowledgement chain are
