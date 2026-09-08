@@ -2,7 +2,13 @@
 //
 //   node benches.js <port> --survey --out vanilla.json   what a server does
 //   node benches.js --compare vanilla.json dust.json     whether Dust agrees
-//   node benches.js <port> --check                       the gate
+//
+// **The comparison is the gate; there is no `--check`.** Nothing a single
+// server says about itself can be wrong here in a way this file could notice —
+// see the next paragraph — so the only assertion in this script is the one
+// that has two servers on either side of it. `--compare` exits `1` on any
+// disagreement that is not named in `DECLARED` below, and on any *agreement*
+// that is.
 //
 // # Why this is a survey before it is a check
 //
@@ -85,7 +91,7 @@ function tracker (b) {
   const name = id => (b.registry.items[id] ? b.registry.items[id].name : `id:${id}`)
   const read = item => {
     if (!item || !item.itemCount || item.itemCount === 0) return null
-    return { name: name(item.itemId), count: item.itemCount }
+    return { name: name(item.itemId), count: item.itemCount, components: componentsOf(item) }
   }
   b._client.on('open_window', p => {
     state.opened++
@@ -137,6 +143,25 @@ function creativeSlot (b, slot, itemName, count) {
   b._client.write('set_creative_slot', { slot, item: itemStack(b, itemName, count) })
 }
 
+// The same, carrying components. The row that says a netherite upgrade keeps
+// what the diamond one was: vanilla's `transmuteCopy` moves the base stack's
+// name, enchantments and damage onto the new item, and a server that built the
+// result out of the recipe's own item alone would look right in every check
+// that compared item names.
+function creativeSlotWith (b, slot, itemName, count, components) {
+  b._client.write('set_creative_slot', {
+    slot,
+    item: {
+      itemCount: count,
+      itemId: b.registry.itemsByName[itemName].id,
+      addedComponentCount: components.length,
+      removedComponentCount: 0,
+      components,
+      removeComponents: []
+    }
+  })
+}
+
 function windowClick (b, windowId, slot, mouseButton, mode) {
   b._client.write('window_click', {
     windowId, stateId: 0, slot, mouseButton, mode, changedSlots: [], cursorItem: { itemCount: 0 }
@@ -151,7 +176,27 @@ function pressButton (b, windowId, button) {
 }
 
 function describe (s) {
-  return s ? `${s.name} x${s.count}` : null
+  return s ? `${s.name} x${s.count}${s.components ? ' ' + s.components : ''}` : null
+}
+
+// A component patch as one comparable string — `clicks.js`'s renderer, and for
+// its reason: the order a patch arrives in is not part of what it means.
+function componentsOf (item) {
+  const added = (item.components || [])
+    .map(c => `${c.type}=${c.data === undefined ? 'present' : stable(c.data)}`)
+    .sort()
+  const removed = (item.removeComponents || []).map(c => c.type).sort()
+  if (added.length === 0 && removed.length === 0) return ''
+  return `[${added.join(' ')}${removed.length ? ' -' + removed.join(' -') : ''}]`
+}
+
+function stable (value) {
+  if (value === undefined) return 'absent'
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`
+  if (Buffer.isBuffer(value)) return value.toString('hex')
+  const keys = Object.keys(value).sort()
+  return `{${keys.map(k => `${k}:${stable(value[k])}`).join(',')}}`
 }
 
 function support (bot) {
@@ -199,9 +244,10 @@ async function openBench (bot, block) {
 // and putting it down. Two clicks and not a creative write: a creative write
 // names the *player's* numbering and cannot reach a slot that belongs to a
 // block.
-async function putInto (bot, windowSlot, hotbarWire, item, count) {
+async function putInto (bot, windowSlot, hotbarWire, item, count, components) {
   const state = bot.tracked
-  creativeSlot(bot, 36, item, count)
+  if (components) creativeSlotWith(bot, 36, item, count, components)
+  else creativeSlot(bot, 36, item, count)
   await wait(CLICK_MS)
   windowClick(bot, state.window, hotbarWire, 0, PICKUP)
   await wait(CLICK_MS)
@@ -215,6 +261,15 @@ async function putInto (bot, windowSlot, hotbarWire, item, count) {
 // deepslate) with room to spare.
 const BUTTON_LIMIT = 24
 
+// **`blackstone` is the one input that carries the ordering claim. Do not
+// remove it.** Measured: with the description-id tie-break deleted, so that a
+// group comes out in the order the recipe files were read, this survey still
+// scores 16 of 17 — five of these six inputs happen to be read in the order
+// vanilla draws them, and only blackstone disagrees (`polished_blackstone`
+// moves from button 4 to button 8, behind its own four brick recipes). Six
+// inputs is a weak instrument for the ordering rule and this comment is what
+// stops that from being an accident. `dust_sim::cutting`'s own unit tests are
+// the other half: three of them go red on the same edit.
 const CUT_INPUTS = [
   'andesite',
   'cobbled_deepslate',
@@ -246,11 +301,93 @@ async function surveyCuts (bot) {
   return { opened, rows }
 }
 
+// What a stonecutter does over more than one click: whether the button stays
+// pressed while the input is spent, whether a shift-click empties the stack,
+// and whether closing the screen gives the input back.
+//
+// **The row that needs more than one reading.** Taking one slab and seeing a
+// slab is not evidence the selection survived: the server could refill from
+// nothing, or from the last press, or not at all, and a single snapshot after
+// a single take looks the same in two of those three. Eight takes with an
+// exact input count afterwards is the shape that can only be one of them.
+async function surveyCutting (bot) {
+  const state = bot.tracked
+  const rows = []
+  const opened = await openBench(bot, 'stonecutter')
+
+  // Eight ordinary takes, one button press.
+  place(bot, opened.placed, 5)
+  await wait(SETTLE_MS)
+  await putInto(bot, CUT_IN, 29, 'stone', 20)
+  pressButton(bot, state.window, 5)
+  await wait(CLICK_MS)
+  const chose = describe(state.slots[CUT_OUT])
+  let taken = 0
+  for (let n = 0; n < 8; n++) {
+    windowClick(bot, state.window, CUT_OUT, 0, PICKUP)
+    await wait(CLICK_MS)
+    // Put the cursor down in the player's half so the next take is not
+    // refused for a full hand.
+    windowClick(bot, state.window, 2 + n, 0, PICKUP)
+    await wait(CLICK_MS)
+    if (state.slots[2 + n]) taken++
+  }
+  rows.push({
+    what: 'eight takes on one press',
+    chose,
+    taken,
+    input: describe(state.slots[CUT_IN]),
+    stillOffered: describe(state.slots[CUT_OUT])
+  })
+
+  // Closing the screen has to give the input back.
+  const held = describe(state.slots[CUT_IN])
+  bot._client.write('close_window', { windowId: state.window })
+  await wait(SETTLE_MS)
+  place(bot, opened.placed, 6)
+  await wait(SETTLE_MS)
+  rows.push({
+    what: 'the input a close gave back',
+    held,
+    left: describe(state.slots[CUT_IN])
+  })
+
+  // An input nothing cuts.
+  await putInto(bot, CUT_IN, 29, 'dirt', 4)
+  pressButton(bot, state.window, 0)
+  await wait(CLICK_MS)
+  rows.push({
+    what: 'an input nothing cuts',
+    result: describe(state.slots[CUT_OUT]),
+    selected: state.property
+  })
+  return { opened, rows }
+}
+
 const SMITH_CASES = [
   {
     what: 'a netherite upgrade',
     template: 'netherite_upgrade_smithing_template',
     base: 'diamond_chestplate',
+    addition: 'netherite_ingot'
+  },
+  {
+    // Vanilla's `transmuteCopy` keeps the base's components. A result built
+    // from the recipe's own item would be a plain netherite chestplate and
+    // would pass any check that read the item name.
+    what: 'an upgrade of a named, damaged chestplate',
+    template: 'netherite_upgrade_smithing_template',
+    base: 'diamond_chestplate',
+    baseComponents: [
+      { type: 'damage', data: 137 },
+      { type: 'custom_name', data: { type: 'string', name: '', value: 'Old Faithful' } }
+    ],
+    addition: 'netherite_ingot'
+  },
+  {
+    what: 'a base nothing in this server upgrades or trims',
+    template: 'netherite_upgrade_smithing_template',
+    base: 'stone',
     addition: 'netherite_ingot'
   },
   {
@@ -260,7 +397,12 @@ const SMITH_CASES = [
     addition: 'netherite_upgrade_smithing_template'
   },
   {
-    what: 'a base that is not upgradeable',
+    // **The one row the two servers are expected to differ on**, and it is
+    // named so that the day they stop differing is a failure rather than a
+    // silence. Vanilla's base slot accepts an iron chestplate because its
+    // eighteen `smithing_trim` recipes name `#minecraft:trimmable_armor`
+    // there; Dust does not load trims, so its base slot does not accept one.
+    what: 'armour vanilla would take for a trim',
     template: 'netherite_upgrade_smithing_template',
     base: 'iron_chestplate',
     addition: 'netherite_ingot'
@@ -281,7 +423,7 @@ async function surveySmithing (bot) {
     place(bot, opened.placed, 4)
     await wait(SETTLE_MS)
     if (one.template) await putInto(bot, SMITH_TEMPLATE, 31, one.template, 1)
-    await putInto(bot, SMITH_BASE, 31, one.base, 1)
+    await putInto(bot, SMITH_BASE, 31, one.base, 1, one.baseComponents)
     await putInto(bot, SMITH_ADDITION, 31, one.addition, 1)
     const result = describe(state.slots[SMITH_OUT])
     // Take it, and see what the three inputs are afterwards. A result that
@@ -304,6 +446,7 @@ async function survey (port, out) {
   const state = bot.tracked
   await wait(SETTLE_MS)
   const cuts = await surveyCuts(bot)
+  const cutting = await surveyCutting(bot)
   const smith = await surveySmithing(bot)
   const declared = state.recipes
     ? {
@@ -320,6 +463,7 @@ async function survey (port, out) {
     smithMenu: smith.opened.menu,
     smithBlock: smith.opened.block,
     cuts: cuts.rows,
+    cutting: cutting.rows,
     smithing: smith.rows,
     declared
   }
@@ -328,6 +472,7 @@ async function survey (port, out) {
     const made = row.made.filter(m => m.out).map(m => `${m.button}:${m.out}`)
     console.log(`${row.input}  ${made.length} button(s)  ${made.join(' ')}`)
   }
+  for (const row of record.cutting) console.log(JSON.stringify(row))
   for (const row of record.smithing) {
     console.log(`${row.what}  -> ${row.result}  (left ${row.afterTemplate}, ${row.afterBase}, ${row.afterAddition})`)
   }
@@ -341,7 +486,7 @@ async function main () {
   if (args[0] === '--compare') return compare(args[1], args[2])
   const port = Number(args[0])
   if (!port) {
-    console.log('usage: benches.js <port> [--survey --out file.json | --check]')
+    console.log('usage: benches.js <port> --survey [--out file.json]')
     console.log('       benches.js --compare vanilla.json dust.json')
     process.exit(2)
   }
@@ -353,9 +498,99 @@ async function main () {
   process.exit(2)
 }
 
-function compare (a, b) {
-  console.log('not yet')
-  process.exit(2)
+// The rows the two servers are *expected* to disagree on, by their `what`, and
+// why. A named divergence that stops diverging is a failure too: the day
+// somebody loads the trim recipes this row flips, and the check says so
+// instead of quietly agreeing with a record that has gone stale.
+const DECLARED = new Map([
+  [
+    'the same number of smithing recipes',
+    'A real 1.21.1 server declares 27 — nine `smithing_transform` and eighteen ' +
+      '`smithing_trim`. Dust declares the nine. A trim\'s result is a ' +
+      '`minecraft:trim` component this server would have to author, and Dust ' +
+      'carries components rather than writing them. See decision record 0037.'
+  ],
+  [
+    'armour vanilla would take for a trim',
+    'The same eighteen recipes, seen from the other end. Vanilla\'s base slot ' +
+      'takes an iron chestplate because `#minecraft:trimmable_armor` names it ' +
+      'there; Dust has no recipe that accepts one, so the click bounces and the ' +
+      'slot stays empty. See decision record 0037.'
+  ]
+])
+
+function compare (vanillaFile, dustFile) {
+  const v = JSON.parse(require('fs').readFileSync(vanillaFile, 'utf8'))
+  const d = JSON.parse(require('fs').readFileSync(dustFile, 'utf8'))
+  const rows = []
+  const say = (what, a, b) => rows.push({ what, a: stable(a), b: stable(b) })
+
+  say('the stonecutter opens the same menu', v.cutMenu, d.cutMenu)
+  say('the smithing table opens the same menu', v.smithMenu, d.smithMenu)
+  say(
+    'both servers declared the same number of stonecutting recipes',
+    v.declared && v.declared.stonecutting,
+    d.declared && d.declared.stonecutting
+  )
+  say(
+    'both servers declared the same number of smithing recipes',
+    v.declared && v.declared.smithing,
+    d.declared && d.declared.smithing
+  )
+
+  // One row per input, comparing the *whole* button sequence. Not "the same
+  // number of buttons" and not "the same set": the order is the thing under
+  // test, and both of the weaker forms pass a server that sorted differently.
+  for (let i = 0; i < Math.max(v.cuts.length, d.cuts.length); i++) {
+    const a = v.cuts[i]
+    const b = d.cuts[i]
+    say(
+      `every button of ${a ? a.input : '?'} makes what vanilla makes`,
+      a && a.made.map(m => `${m.button}:${m.out}`),
+      b && b.made.map(m => `${m.button}:${m.out}`)
+    )
+  }
+  for (let i = 0; i < Math.max(v.cutting.length, d.cutting.length); i++) {
+    const a = v.cutting[i]
+    const b = d.cutting[i]
+    say(`stonecutter: ${a ? a.what : '?'}`, a, b)
+  }
+  for (let i = 0; i < Math.max(v.smithing.length, d.smithing.length); i++) {
+    const a = v.smithing[i]
+    const b = d.smithing[i]
+    say(`smithing: ${a ? a.what : '?'}`, a, b)
+  }
+
+  let same = 0
+  let diverged = 0
+  let unexpected = 0
+  for (const row of rows) {
+    const declaredFor = [...DECLARED.keys()].find(key => row.what.includes(key))
+    const agrees = row.a === row.b
+    if (agrees && declaredFor) {
+      unexpected++
+      console.log(`  FAIL  ${row.what}`)
+      console.log('        the two servers now agree, and this row is recorded as a divergence')
+      continue
+    }
+    if (agrees) {
+      same++
+      console.log(`  ok    ${row.what}`)
+      continue
+    }
+    if (declaredFor) {
+      diverged++
+      console.log(`  known ${row.what}`)
+      console.log(`        ${DECLARED.get(declaredFor)}`)
+      continue
+    }
+    unexpected++
+    console.log(`  FAIL  ${row.what}`)
+    console.log(`        vanilla ${row.a}`)
+    console.log(`        dust    ${row.b}`)
+  }
+  console.log(`\n${same}/${rows.length - diverged} rows identical, ${diverged} declared divergence(s)`)
+  process.exit(unexpected === 0 ? 0 : 1)
 }
 
 main().catch(e => { console.error(e.message); process.exit(1) })

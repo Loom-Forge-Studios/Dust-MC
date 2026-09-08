@@ -148,3 +148,19 @@ join port="25565" joiners="4" where="each":
 # comparison against a real 1.21.1 server is what decision record 0029 is.
 equipment port="25565":
     cd tools/bot && node equipment.js {{port}}
+
+# What a stonecutter and a smithing table do, recorded rather than asserted.
+#
+#   just benches 25603 dust.json                    record from a running server
+#   node benches.js 25703 --survey --out v.json     a real 1.21.1 server
+#   node benches.js --compare v.json dust.json      the gate
+#
+# **There is no single-server check here and that is deliberate.** A
+# stonecutter's buttons are an index into a list the *client* sorted, and
+# neither side puts that order on the wire — so there is no answer one server
+# can give on its own that this script could tell was wrong. The comparison is
+# the measurement; `--compare` exits 1 on any disagreement that is not named in
+# the script, and on any agreement that is. Outside `verify` for the same
+# reason `bot` is, and decision record 0037 is what it produced.
+benches port="25565" out="benches.json":
+    cd tools/bot && node benches.js {{port}} --survey --out {{out}}
