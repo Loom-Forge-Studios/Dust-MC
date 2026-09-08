@@ -130,8 +130,15 @@ pockets Dust had flooded, and 23 of them still are. Then it cuts the dimension's
 own **carvers** through the result — the tunnels and the ravines — which takes
 what is left of that count from 187,614 to 18,433, so **97.3% of the cells
 Minecraft carved on seed 0's sample are open here too**, and turns eight cells
-of air under a player at spawn into 1,738. **Not** the features that come after,
-so there are still no trees and no ore veins. How far that is from the world
+of air under a player at spawn into 1,738. Then it places the **features** those
+caves are worth digging for: `minecraft:ore`, which is the coal, iron, copper,
+gold, redstone, lapis, diamond and emerald a player mines and the tuff,
+andesite, diorite and granite the same feature type puts in the stone around
+them — **1,838,763 cells of block disagreement down to 304,789 on seed 0 and
+1,809,196 down to 240,508 on seed 1**, one stage closing 83% and 87% of what
+was left. `[worldgen.ores]` scales it, and with the defaults it scales it by not
+running. **Not** trees or plants, which is what the histogram is now mostly made
+of. How far that is from the world
 Minecraft generates for the same seed is measured rather than estimated —
 `cargo xtask harness worldgen` scores it in six parts. Decision record
 [0012](docs/decisions/0012-what-worldgen-is-worth-measured-first.md) is what
@@ -144,7 +151,9 @@ is the terrain and what a served world does at the edge of a world file, and
 aquifer — and
 [0035](docs/decisions/0035-what-a-cave-holds.md) is the aquifers that finding
 sent for and
-[0039](docs/decisions/0039-what-a-carver-digs.md) the carvers after them, both
+[0039](docs/decisions/0039-what-a-carver-digs.md) the carvers after them and
+[0043](docs/decisions/0043-what-a-chunks-ore-is-drawn-against.md) the ore in
+what they dug, all three
 recovered from the operator's own server jar because they are the stages of
 worldgen that are code rather than data. A world
 is a disc in an infinite plane and a player can walk off the edge of it: with
@@ -764,7 +773,7 @@ inside a number that already looked good.
 
 `worldgen` asks the same question of the terrain, and asks it in five parts. It
 counts how far Dust's world is from the one Minecraft generates for the same
-seed, and which stage of vanilla's pipeline owns which part of the gap. Eleven
+seed, and which stage of vanilla's pipeline owns which part of the gap. Twelve
 models over the same chunks in one run, each row the one above it plus a single
 named change, and every figure a count of things **wrong**:
 
@@ -780,6 +789,7 @@ seed 0, twelve 5x5 squares to sixteen thousand blocks out -- 17 biomes in view
     28796    32398       382   588215     75560     2529567     18.8  + Dust's surface rules
     28784    32393       382   187614     90892     2097950     18.8  + Dust's aquifers
     28349    32345       382    18433     92418     1838763     18.8  + Dust's carvers
+    28349    32106       382    18433     92418      304789     19.1  + Dust's features
         0    60037         0   681715         0    10405644     19.6  + Minecraft's surface height
         0    60037         0        0         0     9723929     19.6  + Minecraft's carvers
         0        0         0        0         0       12140     20.6  + its blocks at and below it
@@ -817,11 +827,26 @@ block in the columns whose *height* disagrees — 25,938 of the 28,796 are leave
 and 2,279 more are packed ice. Every delta is negative; Dust is never too high.
 Seed 1 goes 72,552 to **16,678** the same way.
 
+**Row eight is the ore, and it is the largest single step on the ladder.**
+`minecraft:ore` is one configured-feature type out of the pack's thirty that
+run and a hundred and twenty-one that are read, ordered and skipped by name with
+a count — and it takes 1,838,763 wrong cells to **304,789**, 1,809,196 to
+**240,508** on seed 1. Most of that is not ore: tuff, andesite, diorite and
+granite were 1,237,435 of seed 0's shortfall and the same feature type places
+them. What sits at the top of the histogram now is leaves. Decision record
+[0043](docs/decisions/0043-what-a-chunks-ore-is-drawn-against.md) is the stage,
+and the summary prints **both sides** of a block the two worlds disagree about,
+because one list cannot say whether a block is missing because it was never
+placed or because it was placed one cell over.
+
 **Two seeds, because one cannot see.** Seed 1 spawns in open ocean, where every
 column has water underfoot and is short by *exactly one* under the sea-level
 rung, because `sea_level: 63` names the level water reaches *to* and the topmost
 water block is at 62. It sees twenty biomes to seed 0's seventeen and agrees
-about almost no other number here.
+about almost no other number here — and it is the seed that shows what the ore
+still gets wrong: 15,144 cells of `coal_ore` where Minecraft has stone sit
+directly beside 13,707 of stone where Minecraft has `coal_ore`. The same veins,
+one cell over.
 
 **The shape of the sample matters more than its size.** `--at` is repeatable:
 the twelve scattered 5x5 squares above hold not quite four times the chunks of a
@@ -833,7 +858,14 @@ Cost is scored beside accuracy, because this code runs for every chunk a player
 walks toward: a real column's blocks are 20.7 KiB against a flat one's 2.2, and
 **light is 96 KiB more per column whatever the terrain** — at the default view
 distance a join is 5.8 MiB of blocks once terrain is real and 27 MiB of light
-either way. Decision records
+either way. Time is measured by `cargo bench -p dust-server --bench join` and
+not by the ladder's own `cols/s`, which is wall time on whatever machine ran it:
+the 289 columns of a join build in 2,148 ms with the carvers and 3,364 ms with
+the features on top, **11.6 ms a column against 7.4**. The first honest number
+for the feature stage was 128 ms a column, because a vein two chunks away still
+reaches in and the window of column heights it reads was being rebuilt for every
+column — a cache that is right for a scan and useless for the nearest-first
+spiral a join actually streams in. Decision records
 [0012](docs/decisions/0012-what-worldgen-is-worth-measured-first.md) and
 [0021](docs/decisions/0021-which-biome-a-cell-gets.md) are what the ladder was
 built to write: what each stage is worth, what it costs, and the order to build

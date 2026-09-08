@@ -21,11 +21,17 @@
 //! to walk rather than somewhere to drown. Decision records 0032, 0035 and
 //! 0039 are what each of those is worth.
 //!
-//! What is still missing is **features and structures** — no trees, no ore
-//! veins, no mineshafts, no villages. Record 0039 prices what is left: 97.3%
-//! of the cells Minecraft carved on seed 0's sample are open here too, and the
-//! 18,433 that are not are mostly things something *built*, not something a
-//! carver dug.
+//! `dust_gen::feature` then places what the biomes in view name, which today is
+//! `minecraft:ore` and nothing else — so a player who digs finds coal, iron,
+//! copper, gold, redstone, lapis, diamond and emerald where Minecraft put them,
+//! in among the tuff, andesite, diorite and granite the same feature type
+//! places. `[worldgen.ores]` is applied to those placements at boot; with the
+//! defaults it is applied by not running, which is what decision record 0006
+//! asks for and what lets vanilla parity be tested against a server that has
+//! the setting compiled in.
+//!
+//! What is still missing is **trees, plants and structures** — no oaks, no
+//! grass, no mineshafts, no villages. Record 0043 prices what is left.
 //!
 //! # Why the light needs the four columns around it
 //!
@@ -106,6 +112,20 @@ pub struct GeneratedWorld {
     default_biome: u32,
     biome_registry_size: u32,
     floors: Mutex<HashMap<(i32, i32), SkyFloor>>,
+    /// `OCEAN_FLOOR_WG` per generated chunk, which is what the feature stage
+    /// reads before it draws a vein.
+    ///
+    /// Kept here rather than in the generator's own scratch because of the
+    /// *order* a join builds columns in. A vein whose origin is two chunks away
+    /// still reaches in, so every column served asks about the 5x5 window
+    /// around it, and the only way to answer for a chunk is to build its
+    /// terrain. The scratch's own cache is five rows deep and direct-mapped:
+    /// right for a scan, useless for the nearest-first spiral a join streams
+    /// in, which made every column pay twenty-five terrain fills instead of
+    /// one — 128 ms a column, 37 s for a 289-column join. A shared map keyed by
+    /// position turns that back into one fill per chunk of the region, at
+    /// 512 bytes each.
+    heights: Mutex<HashMap<(i32, i32), [i16; 256]>>,
 }
 
 impl GeneratedWorld {
@@ -124,14 +144,14 @@ impl GeneratedWorld {
         // if this build's registry has no lava — a generator that quietly
         // defaulted it would fill a deep cave with air and look right.
         let lava = state_of(&dust_gen::aquifer::Aquifer::lava_block())?;
-        let surface = match generator.surface() {
-            Some(rules) => rules
-                .palette()
-                .iter()
-                .map(state_of)
-                .collect::<Result<Vec<u32>, MissingBlock>>()?,
-            None => Vec::new(),
-        };
+        // One palette: the surface rules' blocks and then the ones the feature
+        // stage writes. Two lists would map an ore's material code onto
+        // whichever surface block happened to sit at that index.
+        let surface = generator
+            .block_palette()
+            .iter()
+            .map(state_of)
+            .collect::<Result<Vec<u32>, MissingBlock>>()?;
         Ok(Self {
             emission: super::world::emission_of(constants.as_deref()),
             height: flat.height(),
@@ -147,6 +167,7 @@ impl GeneratedWorld {
             default_biome,
             biome_registry_size,
             floors: Mutex::new(HashMap::new()),
+            heights: Mutex::new(HashMap::new()),
         })
     }
 
@@ -228,7 +249,8 @@ impl GeneratedWorld {
         let top = min_y + self.height.height() as i32;
         {
             let materials = if with_biomes {
-                columns.carve(pos.x, pos.z)
+                let window = self.window_heights(&mut columns, pos);
+                columns.features_over(pos.x, pos.z, &window)
             } else {
                 columns.terrain(pos.x, pos.z)
             };
@@ -281,6 +303,58 @@ impl GeneratedWorld {
             self.constants.as_deref(),
         ));
         chunk
+    }
+
+    /// `OCEAN_FLOOR_WG` over the window the feature stage reads, out of the
+    /// shared cache, building only the chunks nothing has built yet.
+    fn window_heights(
+        &self,
+        columns: &mut dust_gen::terrain::Columns<'_>,
+        pos: ChunkPos,
+    ) -> Vec<i16> {
+        let radius = dust_gen::feature::WINDOW_RADIUS;
+        let width = dust_gen::feature::WINDOW;
+        let mut window = vec![0i16; width * width];
+        for offset_z in -radius..=radius {
+            for offset_x in -radius..=radius {
+                let (near_x, near_z) = (pos.x + offset_x, pos.z + offset_z);
+                let heights = self.chunk_heights(columns, near_x, near_z);
+                let base_x = ((offset_x + radius) * 16) as usize;
+                let base_z = ((offset_z + radius) * 16) as usize;
+                for local_z in 0..16usize {
+                    let row = (base_z + local_z) * width + base_x;
+                    window[row..row + 16]
+                        .copy_from_slice(&heights[local_z * 16..local_z * 16 + 16]);
+                }
+            }
+        }
+        window
+    }
+
+    fn chunk_heights(
+        &self,
+        columns: &mut dust_gen::terrain::Columns<'_>,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> [i16; 256] {
+        if let Some(held) = self
+            .heights
+            .lock()
+            .expect("the height map is never poisoned")
+            .get(&(chunk_x, chunk_z))
+        {
+            return *held;
+        }
+        let heights = columns.ocean_floor_heights(chunk_x, chunk_z);
+        let mut cache = self
+            .heights
+            .lock()
+            .expect("the height map is never poisoned");
+        if cache.len() >= SKY_FLOOR_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert((chunk_x, chunk_z), heights);
+        heights
     }
 
     /// Where the sky reaches in a *neighbouring* column, remembered.
@@ -345,6 +419,7 @@ pub fn beside(
     default_biome: u32,
     biome_registry_size: u32,
     constants: Option<std::sync::Arc<dust_registry::BlockConstants>>,
+    ores: &dust_config::ore::OresConfig,
 ) -> Result<Option<(GeneratedWorld, Report)>, String> {
     let table = data_path.join(dust_gen::biome::FILE);
     let text = match std::fs::read_to_string(&table) {
@@ -378,8 +453,43 @@ pub fn beside(
     // have is reported and left unbound rather than matched against
     // everything, because a `biome_is` that matched everything would put a
     // beach across a continent.
-    let unbound = generator.bind_surface_biomes(|name| names.biome(name));
+    let mut unbound = generator.bind_surface_biomes(|name| names.biome(name));
+    // The feature stage asks the running build two things rather than deciding
+    // them: which id each biome name has, and which blocks count towards
+    // `OCEAN_FLOOR_WG` -- the heightmap an ore consults before it draws a vein
+    // at all. The second is a column of the operator's own constants table.
+    // Without an answer for every block no feature runs, and the boot line says
+    // so rather than putting ore in the sky.
+    let ocean_floor = constants
+        .as_deref()
+        .and_then(|table| table.flag("OCEAN_FLOOR_WG").map(|flag| (table, flag)));
+    unbound.extend(generator.bind_features(
+        |name| names.biome(name),
+        |spec| {
+            let (table, flag) = ocean_floor?;
+            Some(table.is_set(flag, state_of(spec).ok()?))
+        },
+    ));
+    unbound.sort();
+    unbound.dedup();
+    // `[worldgen.ores]`, applied to the ores this world actually has rather
+    // than to a table of vanilla's. Two things happen here and they are
+    // different: a name the world has never heard of is an error naming the
+    // nearest match, which is the check D6 says cannot be done until a world is
+    // loaded; and the settings themselves are applied, which with the defaults
+    // means nothing is applied at all and the pack's own placements run.
+    let ore_groups = generator.ore_groups();
+    let unknown_ores: Vec<String> = ores
+        .validate_against(&ore_groups, "worldgen.ores")
+        .into_iter()
+        .map(|finding| format!("{}: {}", finding.path, finding.message))
+        .collect();
+    let ore_settings = generator.apply_ore_settings(ores);
     let surface_blocks = generator.surface().map_or(0, |rules| rules.palette().len());
+    let features = generator
+        .features()
+        .filter(|features| features.ocean_floor_bound())
+        .map_or((0, 0), dust_gen::feature::Features::coverage);
     let settings = generator.settings().clone();
     let world = GeneratedWorld::new(
         generator,
@@ -400,6 +510,10 @@ pub fn beside(
             default_block: settings.default_block.name,
             default_fluid: settings.default_fluid.name,
             surface_blocks,
+            features,
+            ore_groups: ore_groups.len(),
+            ore_settings,
+            unknown_ores,
             unbound,
         },
     )))
@@ -418,6 +532,20 @@ pub struct Report {
     /// How many distinct blocks the dimension's surface rules can write. Zero
     /// means the settings carried no rules and the ground is bare stone.
     pub surface_blocks: usize,
+    /// Placed features this generator runs, and how many the pack's biomes name
+    /// altogether. `(0, 0)` means no feature runs -- either the pack names none
+    /// this generator knows, or nothing answered for `OCEAN_FLOOR_WG`.
+    pub features: (usize, usize),
+    /// How many ore groups this world's data defines — the knobs
+    /// `[worldgen.ores]` may turn.
+    pub ore_groups: usize,
+    /// What `[worldgen.ores]` did to them, which with the defaults is nothing.
+    pub ore_settings: dust_gen::feature::OreSettings,
+    /// `[worldgen.ores.overrides]` entries naming an ore this world does not
+    /// generate, each with the nearest name it does. An operator who wrote one
+    /// has a server that started and a setting that did nothing, which is the
+    /// outcome decision record 0006 calls the worst available.
+    pub unknown_ores: Vec<String>,
     /// Biomes the rules ask about that this registry does not have.
     pub unbound: Vec<String>,
 }
@@ -429,9 +557,13 @@ impl Report {
         } else {
             format!("surface rules over {} block(s)", self.surface_blocks)
         };
+        let features = match self.features {
+            (0, 0) => "no features".to_owned(),
+            (running, read) => format!("{running} of {read} placed feature(s)"),
+        };
         let mut line = format!(
             "generating from seed {seed}: {} climate region(s) over {} biome(s), \
-             {} above sea level {}, {surface}",
+             {} above sea level {}, {surface}, {features}",
             self.regions, self.biomes, self.default_fluid, self.sea_level,
         );
         if !self.moved.is_empty() {
@@ -441,9 +573,30 @@ impl Report {
                 self.moved.join(", ")
             ));
         }
+        if !self.ore_settings.is_empty() {
+            let settings = &self.ore_settings;
+            line.push_str(&format!(
+                " — and [worldgen.ores] over {} ore group(s) scaled {}, switched off {}                  and left {} alone",
+                self.ore_groups,
+                settings.scaled.len(),
+                settings.disabled.len(),
+                settings.untouched.len()
+            ));
+            for note in &settings.notes {
+                line.push_str(&format!(" — {note}"));
+            }
+        }
+        if !self.unknown_ores.is_empty() {
+            line.push_str(&format!(
+                " — and {} ore setting(s) name nothing this world generates: {}",
+                self.unknown_ores.len(),
+                self.unknown_ores.join("; ")
+            ));
+        }
         if !self.unbound.is_empty() {
             line.push_str(&format!(
-                " — and the surface rules name {} biome(s) this registry does not have: {}",
+                " — and {} name(s) the rules or the features ask about are not in this \
+                 registry: {}",
                 self.unbound.len(),
                 self.unbound.join(", ")
             ));

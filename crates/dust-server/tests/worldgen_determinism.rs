@@ -64,6 +64,7 @@ fn world() -> GeneratedWorld {
         0,
         64,
         Some(constants),
+        &dust_config::ore::OresConfig::default(),
     ) {
         Ok(Some((world, _))) => world,
         Ok(None) => panic!("no dust-biomes.tsv under {}", data.display()),

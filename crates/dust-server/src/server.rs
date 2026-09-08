@@ -1124,6 +1124,7 @@ impl Server {
                 plains,
                 biomes.entries.len() as u32,
                 constants.clone(),
+                &config.worldgen.ores,
             )
             .map_err(fail)?
             .map(|(world, report)| (world, report, seed)),

@@ -91,6 +91,7 @@ fn main() {
             0,
             64,
             Some(Arc::clone(&constants)),
+            &dust_config::ore::OresConfig::default(),
         ) {
             Ok(Some((world, _))) => ladder(
                 "generated",

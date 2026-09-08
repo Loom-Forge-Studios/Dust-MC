@@ -1055,171 +1055,61 @@ fn one_key(value: &Value, path: &Path) -> Result<(String, i32), String> {
 // Grouping
 // ---------------------------------------------------------------------------
 
-/// Union-find over placement indices.
-#[derive(Debug)]
-struct Components(Vec<usize>);
-
-impl Components {
-    fn new(n: usize) -> Self {
-        Self((0..n).collect())
-    }
-
-    fn find(&mut self, mut x: usize) -> usize {
-        while self.0[x] != x {
-            self.0[x] = self.0[self.0[x]];
-            x = self.0[x];
-        }
-        x
-    }
-
-    fn union(&mut self, a: usize, b: usize) {
-        let (a, b) = (self.find(a), self.find(b));
-        if a != b {
-            self.0[a] = b;
-        }
-    }
-}
-
 /// Gather placements into ore groups by the block states they place.
 ///
-/// See the module header for the rule and its limits.
+/// The rule itself is `dust_gen::ore_density::group`, and living there rather
+/// than here is the point: the generator has to key its knob by the same name
+/// this table writes, and two implementations of a naming rule are two chances
+/// for `[worldgen.ores.overrides.diamond]` to name nothing. This function is
+/// the extractor's half — turning indices back into ids, and refusing a world
+/// where one name would mean two ores.
 fn group(raw: &[Raw]) -> Result<(Vec<Group>, Vec<String>), String> {
-    let mut components = Components::new(raw.len());
-    let mut owner: BTreeMap<&str, usize> = BTreeMap::new();
-    for (index, one) in raw.iter().enumerate() {
-        for target in &one.targets {
-            match owner.get(target.as_str()) {
-                Some(&other) => components.union(index, other),
-                None => {
-                    owner.insert(target.as_str(), index);
-                }
-            }
-        }
-    }
+    let placed: Vec<Vec<String>> = raw.iter().map(|one| one.targets.clone()).collect();
+    let grouping = dust_gen::ore_density::group(&placed);
 
-    let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for index in 0..raw.len() {
-        members
-            .entry(components.find(index))
-            .or_default()
-            .push(index);
-    }
-
-    // Every pair of target sets being identical or disjoint is a property of
-    // 1.21.1, not of the format: a datapack could place copper and gold from
-    // one feature and merge two groups an operator thinks of as separate. It is
-    // reported rather than assumed, so the day it stops being true is a line of
-    // output and not a surprise in somebody's world.
-    let overlapping: Vec<&str> = members
-        .values()
-        .filter(|indices| {
-            let first: BTreeSet<&String> = raw[indices[0]].targets.iter().collect();
-            indices
-                .iter()
-                .any(|&i| raw[i].targets.iter().collect::<BTreeSet<_>>() != first)
-        })
-        .flat_map(|indices| indices.iter().map(|&i| raw[i].id.as_str()))
-        .collect();
-
-    let mut groups = Vec::with_capacity(members.len());
-    let mut ungrouped = Vec::new();
-    for indices in members.values() {
-        let mut targets: Vec<String> = indices
+    if !grouping.overlapping.is_empty() {
+        let ids: Vec<&str> = grouping
+            .overlapping
             .iter()
-            .flat_map(|&i| raw[i].targets.iter().cloned())
+            .map(|&i| raw[i].id.as_str())
             .collect();
-        targets.sort();
-        targets.dedup();
-        match group_name(&targets) {
-            Some(name) => groups.push(Group {
-                name,
-                targets,
-                placements: indices.iter().map(|&i| raw[i].id.clone()).collect(),
-            }),
-            None => ungrouped.extend(indices.iter().map(|&i| raw[i].id.clone())),
-        }
+        println!(
+            "note: these placements share some but not all of their target blocks, so \
+             they are one group: {}",
+            ids.join(", ")
+        );
     }
-    groups.sort_by(|a, b| a.name.cmp(&b.name));
-    ungrouped.sort();
 
-    let mut names = BTreeSet::new();
-    for group in &groups {
-        if !names.insert(group.name.clone()) {
+    let mut seen = BTreeSet::new();
+    for one in &grouping.groups {
+        if !seen.insert(one.name.as_str()) {
             return Err(format!(
                 "two ore groups both derive the name `{}`, from different block states \
                  ({}). One knob cannot mean two ores.",
-                group.name,
-                group.targets.join(", ")
+                one.name.as_str(),
+                one.targets.join(", ")
             ));
         }
     }
 
-    if !overlapping.is_empty() {
-        println!(
-            "note: these placements share some but not all of their target blocks, so \
-             they are one group: {}",
-            overlapping.join(", ")
-        );
-    }
-    Ok((groups, ungrouped))
-}
-
-/// The group's name, from the block ids in it.
-///
-/// The longest run of `_`-separated segments every id ends with, or the longest
-/// run they all begin with when they end differently, with a trailing `ore` or
-/// `ores` dropped if anything survives it. `minecraft:` is elided because a
-/// bare resource location means `minecraft:` everywhere else.
-///
-/// `None` when nothing is left, or when the blocks come from several
-/// namespaces and there is no data-derived way to pick a winner. Both are
-/// reported by the caller rather than dropped.
-fn group_name(targets: &[String]) -> Option<String> {
-    let namespaces: BTreeSet<&str> = targets
+    let groups = grouping
+        .groups
         .iter()
-        .map(|t| t.split_once(':').map_or("minecraft", |(ns, _)| ns))
-        .collect();
-    let bodies: Vec<Vec<&str>> = targets
-        .iter()
-        .map(|t| {
-            t.split_once(':')
-                .map_or(t.as_str(), |(_, body)| body)
-                .split('_')
-                .collect()
+        .map(|one| Group {
+            name: one.name.as_str().to_owned(),
+            targets: one.targets.clone(),
+            placements: one.placements.iter().map(|&i| raw[i].id.clone()).collect(),
         })
         .collect();
-
-    let shortest = bodies.iter().map(Vec::len).min()?;
-    let common = |take: for<'a> fn(&'a [&'a str], usize) -> &'a [&'a str]| -> Vec<String> {
-        let mut best: Vec<String> = Vec::new();
-        for n in 1..=shortest {
-            let first = take(&bodies[0], n);
-            if bodies.iter().all(|b| take(b, n) == first) {
-                best = first.iter().map(|s| (*s).to_owned()).collect();
-            } else {
-                break;
-            }
-        }
-        best
-    };
-
-    let mut segments = common(|b, n| &b[b.len() - n..]);
-    if segments.is_empty() {
-        segments = common(|b, n| &b[..n]);
-    }
-    if segments.len() > 1 && matches!(segments.last().map(String::as_str), Some("ore" | "ores")) {
-        segments.pop();
-    }
-    if segments.is_empty() {
-        return None;
-    }
-
-    let body = segments.join("_");
-    match namespaces.iter().copied().collect::<Vec<_>>()[..] {
-        ["minecraft"] => Some(body),
-        [one] => Some(format!("{one}:{body}")),
-        _ => None,
-    }
+    let mut ungrouped: Vec<String> = grouping
+        .of_placement
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.is_none())
+        .map(|(index, _)| raw[index].id.clone())
+        .collect();
+    ungrouped.sort();
+    Ok((groups, ungrouped))
 }
 
 /// Every name `dust_config::ore::VANILLA_ORE_GROUPS` claims vanilla has must
@@ -1925,7 +1815,9 @@ mod tests {
     }
 
     fn names(targets: &[&str]) -> Option<String> {
-        group_name(&targets.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>())
+        dust_gen::ore_density::group_name(
+            &targets.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>(),
+        )
     }
 
     #[test]

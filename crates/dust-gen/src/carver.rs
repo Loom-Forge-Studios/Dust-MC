@@ -490,6 +490,14 @@ impl Cutter<'_> {
     /// rules have already finished with — carvers run *after* the surface in
     /// vanilla's own pipeline, which is why `carveBlock` has a clause about
     /// grass at all.
+    /// Put the counts back to what they were.
+    ///
+    /// The feature stage carves neighbouring chunks purely to read their column
+    /// heights, and those carvings are not this chunk's.
+    pub fn set_counts(&mut self, counts: Counts) {
+        self.counts = counts;
+    }
+
     pub fn carve(
         &mut self,
         chunk_x: i32,
