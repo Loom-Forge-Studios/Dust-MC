@@ -487,7 +487,6 @@ pub fn declaration(
         recipes.push(Recipe {
             id: Identifier::parse(&format!("dust:smith/{index}")).ok()?,
             kind: RecipeKind::SmithingTransform(SmithingTransformData {
-                group: ProtocolString::new(String::new()).ok()?,
                 template: one(transform.template_items().collect()),
                 base: one(transform.base_items().collect()),
                 addition: one(transform.addition_items().collect()),
