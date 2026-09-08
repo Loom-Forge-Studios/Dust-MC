@@ -942,3 +942,69 @@ fn a_sound_position_is_eighths_of_a_block() {
     assert_eq!(eighths(-0.05), 0);
     assert_eq!(eighths(-0.2), -1);
 }
+
+// ---------------------------------------------------------------------------
+// The two smithing bodies, byte for byte
+// ---------------------------------------------------------------------------
+
+/// A smithing recipe's body starts with its template ingredient and **not with
+/// a group string**.
+///
+/// `SmithingTransformRecipe`'s stream codec is four fields — template, base,
+/// addition, result — and `SmithingTrimRecipe`'s is the first three. Every
+/// other recipe in this packet carries a group; these two never did.
+///
+/// **A round trip cannot say this and neither can `mutation.rs`.** Both read
+/// what this crate wrote, so a group written here and read back here agrees
+/// with itself forever while a real client reads the recipe id that follows as
+/// a stack's components and drops the connection. That is what happened, and
+/// it is why this test spells the bytes out rather than encoding and decoding:
+/// the assertion has to be about the layout, not about our agreement with
+/// ourselves. `tools/bot/benches.js` is the check that has a second
+/// implementation on the other side of it; this one is the guard that fails in
+/// CI the day somebody adds the field back.
+#[test]
+fn a_smithing_body_opens_with_its_template_and_carries_no_group() {
+    use dust_protocol::packets::play::containers::{
+        Ingredient, SmithingTransformData, SmithingTrimData,
+    };
+
+    let one = |item_id| Ingredient {
+        items: vec![simple_slot(item_id)],
+    };
+    // A present slot is count, item id, then an empty component patch as two
+    // zeroes; an ingredient is a VarInt count and then that. So each of these
+    // ingredients is exactly five bytes and the layout below is readable.
+    let transform = SmithingTransformData {
+        template: one(1),
+        base: one(2),
+        addition: one(3),
+        result: simple_slot(4),
+    };
+    let mut writer = Writer::new();
+    transform.encode(&mut writer, v()).expect("encodes");
+    assert_eq!(
+        writer.into_bytes(),
+        vec![
+            1, 1, 1, 0, 0, // template: one stack of item 1
+            1, 1, 2, 0, 0, // base: one stack of item 2
+            1, 1, 3, 0, 0, // addition: one stack of item 3
+            1, 4, 0, 0, // result: one of item 4, no ingredient count in front
+        ],
+        "a leading zero here is an empty group, and the client would read the \
+         recipe id after this body as a component patch"
+    );
+
+    let trim = SmithingTrimData {
+        template: one(1),
+        base: one(2),
+        addition: one(3),
+    };
+    let mut writer = Writer::new();
+    trim.encode(&mut writer, v()).expect("encodes");
+    assert_eq!(
+        writer.into_bytes(),
+        vec![1, 1, 1, 0, 0, 1, 1, 2, 0, 0, 1, 1, 3, 0, 0],
+        "a trim has no result either: the client derives it from the template"
+    );
+}

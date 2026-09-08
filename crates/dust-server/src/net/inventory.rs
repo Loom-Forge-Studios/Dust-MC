@@ -194,11 +194,51 @@ pub const FURNACE_OUTPUT: usize = 58;
 /// One past the furnace's slots.
 pub const FURNACE_END: usize = 59;
 
-/// Every slot this container stores: the player's forty-six, the ten a
-/// crafting table adds, and the three a furnace does.
+/// A stonecutter's two slots, `59..=60` in this container's *storage*.
 ///
-/// Under 64, and that is load-bearing: [`Changed`] is a `u64` bitmask.
-pub const STORAGE: usize = 59;
+/// The player's, not a block's — unlike a furnace's three. A stonecutter holds
+/// nothing when nobody is standing at it: vanilla's `StonecutterMenu.removed`
+/// empties the input back into the player, and so does
+/// [`Inventory::closed`].
+pub const CUT_START: usize = 59;
+/// The stonecutter's input, the block being cut.
+pub const CUT_INPUT: usize = 59;
+/// The stonecutter's output: whichever of the buttons is pressed.
+pub const CUT_OUTPUT: usize = 60;
+/// One past the stonecutter's slots.
+pub const CUT_END: usize = 61;
+
+/// A smithing table's four slots, `61..=64` in this container's *storage*.
+///
+/// Template, base, addition, result — vanilla's own order, left to right on
+/// the screen, and the order is load-bearing: the same three items in
+/// different slots are not a recipe, which is measured against a real 1.21.1
+/// server in `tools/bot/benches.js`.
+pub const SMITH_START: usize = 61;
+/// The smithing table's template slot.
+pub const SMITH_TEMPLATE: usize = 61;
+/// The smithing table's base slot: the thing being upgraded.
+pub const SMITH_BASE: usize = 62;
+/// The smithing table's addition slot: the netherite.
+pub const SMITH_ADDITION: usize = 63;
+/// The smithing table's result.
+pub const SMITH_OUTPUT: usize = 64;
+/// One past the smithing table's slots.
+pub const SMITH_END: usize = 65;
+
+/// Every slot this container stores: the player's forty-six, the ten a
+/// crafting table adds, the three a furnace does, a stonecutter's two and a
+/// smithing table's four.
+///
+/// **Sixty-five, which is over a `u64`.** [`Changed`] is a `u128` for that
+/// reason. The alternative was to overlay the three benches on one region,
+/// since a player can have only one screen open — six slots and about a
+/// hundred bytes a player saved. It was not taken: an aliased slot is a
+/// leftover from the last screen appearing in the next one, which is an item
+/// duplication bug with no symptom until somebody notices free diamonds, and
+/// a wider register on a value that is returned once per click costs nothing
+/// measurable.
+pub const STORAGE: usize = 65;
 
 /// The slot number a click outside the window carries.
 pub const OUTSIDE: i16 = -999;
@@ -375,9 +415,36 @@ fn slot_limit(index: usize, item: Item) -> u8 {
 /// The offhand really is unrestricted: a real server accepts a stack of nine
 /// cobblestone into slot 45, which is measured in `tools/bot/clicks.js` and is
 /// not a guess about what looks sensible.
-fn may_place(index: usize, item: Item, fuel: Option<&ItemBlocks>) -> bool {
-    if index == CRAFTING_OUTPUT || index == TABLE_OUTPUT || index == FURNACE_OUTPUT {
+fn may_place(
+    index: usize,
+    item: Item,
+    fuel: Option<&ItemBlocks>,
+    smithing: Option<&dust_sim::smithing::Smithing>,
+) -> bool {
+    if index == CRAFTING_OUTPUT
+        || index == TABLE_OUTPUT
+        || index == FURNACE_OUTPUT
+        || index == CUT_OUTPUT
+        || index == SMITH_OUTPUT
+    {
         return false;
+    }
+    // `SmithingMenu.createInputSlotDefinitions`: each of the three slots
+    // accepts only what *some loaded recipe* names for that position, which is
+    // why a diamond will not go in the template slot on a real server.
+    //
+    // A server with no recipes takes anything, for the reason the fuel slot
+    // does: an empty table has no opinion, and three slots that refused
+    // everything would be a bench a player cannot even load.
+    if (SMITH_TEMPLATE..SMITH_OUTPUT).contains(&index) {
+        let Some(smithing) = smithing.filter(|table| !table.is_empty()) else {
+            return true;
+        };
+        return smithing.iter().any(|one| match index {
+            SMITH_TEMPLATE => one.template_items().any(|allowed| allowed == item),
+            SMITH_BASE => one.base_items().any(|allowed| allowed == item),
+            _ => one.addition_items().any(|allowed| allowed == item),
+        });
     }
     if (ARMOUR_START..ARMOUR_END).contains(&index) {
         return worn_in(item) == Some(index);
@@ -413,7 +480,11 @@ type Destinations = [Option<(std::ops::Range<usize>, bool)>; 2];
 /// of a recipe and pays for it out of the grid, which is
 /// [`Inventory::pickup_result`] and not a write.
 fn writable(index: usize) -> bool {
-    index != CRAFTING_OUTPUT && index != TABLE_OUTPUT && index < STORAGE
+    index != CRAFTING_OUTPUT
+        && index != TABLE_OUTPUT
+        && index != CUT_OUTPUT
+        && index != SMITH_OUTPUT
+        && index < STORAGE
 }
 
 /// Whether this slot is one of a furnace's three.
@@ -505,6 +576,14 @@ pub type Slots = [Option<Stack>; SLOTS];
 /// twenty-seven and nine.
 pub const FURNACE_SLOT_COUNT: usize = 39;
 
+/// How many slots a stonecutter's window numbers: input, result, then the
+/// player's thirty-six.
+pub const CUT_SLOT_COUNT: usize = 38;
+
+/// How many slots a smithing table's window numbers: template, base, addition,
+/// result, then the player's thirty-six.
+pub const SMITH_SLOT_COUNT: usize = 40;
+
 /// Which window a click names, and therefore what its slot numbers mean.
 ///
 /// A window is a *numbering*, not a container. Both of these are views onto
@@ -530,6 +609,16 @@ pub enum Window {
     /// The three slots in front belong to the block, not the player. They are
     /// mirrored into [`FURNACE_START`] for the duration of a click; see there.
     Furnace,
+    /// A stonecutter: `0` the input, `1` the result, `2..=28` the player's
+    /// main inventory and `29..=37` their hotbar.
+    ///
+    /// The result is not a slot a player puts anything in and not a slot the
+    /// server fills on its own: it is whichever of the buttons was last
+    /// pressed, which is why this window has a *selection* and no other does.
+    Stonecutter,
+    /// A smithing table: `0` template, `1` base, `2` addition, `3` the result,
+    /// `4..=30` the player's main inventory and `31..=39` their hotbar.
+    Smithing,
 }
 
 impl Window {
@@ -544,6 +633,8 @@ impl Window {
         match self {
             Self::Player | Self::Table => SLOTS,
             Self::Furnace => FURNACE_SLOT_COUNT,
+            Self::Stonecutter => CUT_SLOT_COUNT,
+            Self::Smithing => SMITH_SLOT_COUNT,
         }
     }
 
@@ -566,6 +657,22 @@ impl Window {
                 2 => FURNACE_OUTPUT,
                 3..=29 => MAIN_START + slot - 3,
                 30..=38 => HOTBAR_START + slot - 30,
+                _ => return None,
+            }),
+            Self::Stonecutter => Some(match slot {
+                0 => CUT_INPUT,
+                1 => CUT_OUTPUT,
+                2..=28 => MAIN_START + slot - 2,
+                29..=37 => HOTBAR_START + slot - 29,
+                _ => return None,
+            }),
+            Self::Smithing => Some(match slot {
+                0 => SMITH_TEMPLATE,
+                1 => SMITH_BASE,
+                2 => SMITH_ADDITION,
+                3 => SMITH_OUTPUT,
+                4..=30 => MAIN_START + slot - 4,
+                31..=39 => HOTBAR_START + slot - 31,
                 _ => return None,
             }),
         }
@@ -592,6 +699,22 @@ impl Window {
                 HOTBAR_START..=44 => storage - HOTBAR_START + 30,
                 _ => return None,
             }),
+            Self::Stonecutter => Some(match storage {
+                CUT_INPUT => 0,
+                CUT_OUTPUT => 1,
+                MAIN_START..=35 => storage - MAIN_START + 2,
+                HOTBAR_START..=44 => storage - HOTBAR_START + 29,
+                _ => return None,
+            }),
+            Self::Smithing => Some(match storage {
+                SMITH_TEMPLATE => 0,
+                SMITH_BASE => 1,
+                SMITH_ADDITION => 2,
+                SMITH_OUTPUT => 3,
+                MAIN_START..=35 => storage - MAIN_START + 4,
+                HOTBAR_START..=44 => storage - HOTBAR_START + 31,
+                _ => return None,
+            }),
         }
     }
 
@@ -611,7 +734,7 @@ impl Window {
                 CRAFTING_WIDTH,
             )),
             Self::Table => Some((TABLE_OUTPUT, TABLE_GRID_START..TABLE_GRID_END, TABLE_WIDTH)),
-            Self::Furnace => None,
+            Self::Furnace | Self::Stonecutter | Self::Smithing => None,
         }
     }
 
@@ -629,6 +752,14 @@ impl Window {
         match self {
             Self::Player => Some(CRAFTING_OUTPUT),
             Self::Table => Some(TABLE_OUTPUT),
+            // Both benches, and a furnace not. The difference is who paid: a
+            // stonecutter's result and a smithing table's result are pictures
+            // of what the slots in front of the player *would* make and are
+            // spent out of those slots when they are taken, exactly as a
+            // grid's is. A furnace's ingot is already made, out of coal that
+            // is already burnt, and taking it costs nothing.
+            Self::Stonecutter => Some(CUT_OUTPUT),
+            Self::Smithing => Some(SMITH_OUTPUT),
             Self::Furnace => None,
         }
     }
@@ -639,6 +770,8 @@ impl Window {
             Self::Player => CRAFTING_OUTPUT,
             Self::Table => TABLE_OUTPUT,
             Self::Furnace => FURNACE_OUTPUT,
+            Self::Stonecutter => CUT_OUTPUT,
+            Self::Smithing => SMITH_OUTPUT,
         }
     }
 }
@@ -651,14 +784,14 @@ impl Window {
 /// report that one slot moved would allocate once per click per player.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Changed {
-    slots: u64,
+    slots: u128,
     cursor: bool,
 }
 
 impl Changed {
     fn mark(&mut self, slot: usize) {
         debug_assert!(slot < STORAGE);
-        self.slots |= 1u64 << slot;
+        self.slots |= 1u128 << slot;
     }
 
     fn mark_cursor(&mut self) {
@@ -668,7 +801,7 @@ impl Changed {
     /// Whether this slot moved.
     #[must_use]
     pub fn has(self, slot: usize) -> bool {
-        slot < STORAGE && self.slots & (1u64 << slot) != 0
+        slot < STORAGE && self.slots & (1u128 << slot) != 0
     }
 
     /// Whether the cursor moved.
@@ -713,8 +846,10 @@ struct Drag {
     /// creative only).
     kind: u8,
     /// The slots collected so far, as a bitmask, for the same reason
-    /// [`Changed`] is one.
-    slots: u64,
+    /// [`Changed`] is one — and the same width, because a smithing table's
+    /// result is storage slot 64 and `1u64 << 64` is not a shift, it is a
+    /// panic.
+    slots: u128,
     count: u8,
 }
 
@@ -724,8 +859,8 @@ impl Drag {
     }
 
     fn add(&mut self, slot: usize) {
-        if self.slots & (1u64 << slot) == 0 {
-            self.slots |= 1u64 << slot;
+        if self.slots & (1u128 << slot) == 0 {
+            self.slots |= 1u128 << slot;
             self.count += 1;
         }
     }
@@ -769,6 +904,27 @@ pub struct Inventory {
     /// `None` is a server with no `[data] path`, and a fuel slot then takes
     /// anything rather than nothing — see [`may_place`].
     fuel: Option<Arc<ItemBlocks>>,
+    /// What a stonecutter cuts, in the order its buttons are drawn. Shared,
+    /// like the recipes.
+    cutting: Option<Arc<dust_sim::cutting::Cutting>>,
+    /// What a smithing table upgrades. Shared, and read by [`may_place`] as
+    /// well as by the result: the three input slots each accept only what some
+    /// recipe names for that position.
+    smithing: Option<Arc<dust_sim::smithing::Smithing>>,
+    /// Which button of the open stonecutter is pressed, or `None` for none.
+    ///
+    /// **A position in a list, not a recipe.** Vanilla's own
+    /// `StonecutterMenu.selectedRecipeIndex` is the same thing and it is the
+    /// number the client sends; keeping the recipe instead would be a
+    /// different value that happens to agree until the input changes.
+    cut_choice: Option<usize>,
+    /// What was in the stonecutter's input when the list was last built.
+    ///
+    /// The selection survives the *count* changing and not the *item*
+    /// changing, which is `StonecutterMenu.slotsChanged` exactly — and it is
+    /// what lets a player take eight slabs out in a row without pressing the
+    /// button again.
+    cut_input: Option<Item>,
 }
 
 impl Default for Inventory {
@@ -783,6 +939,10 @@ impl Default for Inventory {
             cooking: None,
             fire: None,
             fuel: None,
+            cutting: None,
+            smithing: None,
+            cut_choice: None,
+            cut_input: None,
         }
     }
 }
@@ -818,6 +978,57 @@ impl Inventory {
         self.fuel = Some(fuel);
         self.cooking = Some(cooking);
         self
+    }
+
+    /// The two benches' tables, shared with every other session.
+    #[must_use]
+    pub fn at_benches(
+        mut self,
+        cutting: Arc<dust_sim::cutting::Cutting>,
+        smithing: Arc<dust_sim::smithing::Smithing>,
+    ) -> Self {
+        self.cutting = Some(cutting);
+        self.smithing = Some(smithing);
+        self
+    }
+
+    /// Press one of the stonecutter's buttons, and say what moved.
+    ///
+    /// An index outside the list is **ignored, keeping the last selection** —
+    /// vanilla's `StonecutterMenu.clickMenuButton` guards with
+    /// `isValidRecipeIndex` and does nothing when it fails, which is measured:
+    /// pressing buttons 6 through 23 with andesite in a real 1.21.1 server
+    /// leaves button 5's polished andesite stairs in the result slot rather
+    /// than emptying it.
+    pub fn choose_cut(&mut self, index: i32) -> Changed {
+        let mut changed = Changed::default();
+        let Ok(index) = usize::try_from(index) else {
+            return changed;
+        };
+        if index >= self.cut_list().len() {
+            return changed;
+        }
+        self.cut_choice = Some(index);
+        self.refresh_cut(&mut changed);
+        changed
+    }
+
+    /// Which button is pressed, for the property the screen draws its
+    /// highlight from. `-1` is vanilla's own "none".
+    #[must_use]
+    pub fn cut_choice(&self) -> i32 {
+        self.cut_choice.map_or(-1, |index| index as i32)
+    }
+
+    /// What the stonecutter's input can be cut into, in button order.
+    fn cut_list(&self) -> &[dust_sim::cutting::Cut] {
+        let Some(cutting) = self.cutting.as_ref() else {
+            return &[];
+        };
+        let Some(input) = self.slots[CUT_INPUT].as_ref() else {
+            return &[];
+        };
+        cutting.cuts_of(input.item)
     }
 
     /// Which fire the open furnace is, if one is open.
@@ -1104,6 +1315,15 @@ impl Inventory {
                 self.refresh_output(window, &mut changed);
             }
         }
+        // The two benches, on the same rule and for the same reason: their
+        // results are functions of the slots in front of the player, and a
+        // click that moved one of those slots has to leave the result right.
+        if changed.has(CUT_INPUT) {
+            self.refresh_cut(&mut changed);
+        }
+        if (SMITH_TEMPLATE..SMITH_OUTPUT).any(|slot| changed.has(slot)) {
+            self.refresh_smithed(&mut changed);
+        }
         changed
     }
 
@@ -1113,6 +1333,11 @@ impl Inventory {
     /// it: it has no opinion, and clearing a slot it cannot fill would be a
     /// server with no data path deleting whatever a save had put there.
     fn refresh_output(&mut self, window: Window, changed: &mut Changed) {
+        match window {
+            Window::Stonecutter => return self.refresh_cut(changed),
+            Window::Smithing => return self.refresh_smithed(changed),
+            _ => {}
+        }
         let Some(recipes) = self.recipes.as_ref() else {
             return;
         };
@@ -1139,6 +1364,61 @@ impl Inventory {
         }
     }
 
+    /// Put in the stonecutter's result slot whatever button is pressed makes.
+    ///
+    /// Vanilla's `StonecutterMenu.slotsChanged` plus `setupResultSlot`, and
+    /// the split between them is the rule that matters: the *list* is rebuilt
+    /// and the selection cleared only when the input's **item** changes, not
+    /// when its count does. Taking a slab spends one of the input, which
+    /// changes the count and not the item, so the button stays pressed and the
+    /// next slab appears — which is what makes a stonecutter usable at all.
+    fn refresh_cut(&mut self, changed: &mut Changed) {
+        let now = self.slots[CUT_INPUT].as_ref().map(|stack| stack.item);
+        if now != self.cut_input {
+            self.cut_input = now;
+            self.cut_choice = None;
+        }
+        let made = self
+            .cut_choice
+            .and_then(|index| self.cut_list().get(index).copied())
+            .map(|cut| {
+                let (item, count) = cut.result();
+                Stack::new(item, count)
+            });
+        if self.slots[CUT_OUTPUT] != made {
+            self.slots[CUT_OUTPUT] = made;
+            changed.mark(CUT_OUTPUT);
+        }
+    }
+
+    /// Put in the smithing table's result slot whatever the three inputs make.
+    ///
+    /// **The result carries the base's components.** Vanilla's
+    /// `SmithingTransformRecipe.assemble` calls `transmuteCopy`, which keeps
+    /// the base stack's name, enchantments and damage and changes only which
+    /// item it is. Building a fresh stack out of the recipe's own item would
+    /// silently strip every enchantment a player spent levels on, and it would
+    /// look right in every test that only compared item ids.
+    fn refresh_smithed(&mut self, changed: &mut Changed) {
+        let made = self.smithed();
+        if self.slots[SMITH_OUTPUT] != made {
+            self.slots[SMITH_OUTPUT] = made;
+            changed.mark(SMITH_OUTPUT);
+        }
+    }
+
+    fn smithed(&self) -> Option<Stack> {
+        let smithing = self.smithing.as_ref()?;
+        let base = self.slots[SMITH_BASE].as_ref()?;
+        let found = smithing.find(
+            self.slots[SMITH_TEMPLATE].as_ref()?.item,
+            base.item,
+            self.slots[SMITH_ADDITION].as_ref()?.item,
+        )?;
+        let (item, count) = found.result();
+        Some(Stack::with_components(item, count, base.components.clone()))
+    }
+
     /// Pay for one craft: one item out of every occupied grid slot, and
     /// whatever those items leave behind put back.
     ///
@@ -1147,6 +1427,27 @@ impl Inventory {
     /// which is the one failure crafting must not have. See decision record
     /// 0031.
     fn take_result(&mut self, window: Window, changed: &mut Changed) {
+        // A bench has no grid and still has to be paid for. `StonecutterMenu`
+        // removes one from the input and `SmithingMenu` one from each of the
+        // three; neither leaves a remainder behind, so neither goes near the
+        // bucket rule below.
+        let spend: &[usize] = match window {
+            Window::Stonecutter => &[CUT_INPUT],
+            Window::Smithing => &[SMITH_TEMPLATE, SMITH_BASE, SMITH_ADDITION],
+            _ => &[],
+        };
+        if !spend.is_empty() {
+            for &index in spend {
+                let Some(mut stack) = self.slots[index].clone() else {
+                    continue;
+                };
+                stack.count -= 1;
+                self.slots[index] = (stack.count > 0).then_some(stack);
+                changed.mark(index);
+            }
+            self.refresh_output(window, changed);
+            return;
+        }
         let Some((_, grid, _)) = window.crafting() else {
             return;
         };
@@ -1195,9 +1496,24 @@ impl Inventory {
         // back. They belong to the block, they go on smelting after the
         // screen shuts, and a close that emptied them into the player's
         // pockets would be a furnace that could never be left alone.
-        let Some((output, grid, _)) = window.crafting() else {
-            return changed;
+        //
+        // A stonecutter's and a smithing table's *are* the player's, and both
+        // are given back: `StonecutterMenu.removed` and
+        // `ItemCombinerMenu.removed` both call `clearContainer`, so a player
+        // who shuts the screen on a netherite ingot keeps it. Leaving them in
+        // the block would be an item lost to a mis-click.
+        let (output, grid) = match window {
+            Window::Stonecutter => (CUT_OUTPUT, CUT_INPUT..CUT_OUTPUT),
+            Window::Smithing => (SMITH_OUTPUT, SMITH_TEMPLATE..SMITH_OUTPUT),
+            _ => match window.crafting() {
+                Some((output, grid, _)) => (output, grid),
+                None => return changed,
+            },
         };
+        if matches!(window, Window::Stonecutter) {
+            self.cut_choice = None;
+            self.cut_input = None;
+        }
         for index in grid {
             if let Some(stack) = self.slots[index].take() {
                 changed.mark(index);
@@ -1398,7 +1714,12 @@ impl Inventory {
             // A slot that will not take this item at all does nothing, which is
             // what a real server does with cobblestone aimed at a helmet slot.
             (Some(mut held), None) => {
-                if !may_place(index, held.item, self.fuel.as_deref()) {
+                if !may_place(
+                    index,
+                    held.item,
+                    self.fuel.as_deref(),
+                    self.smithing.as_deref(),
+                ) {
                     return;
                 }
                 let moved = held.count.min(limit);
@@ -1411,7 +1732,12 @@ impl Inventory {
             (Some(mut held), Some(mut there))
                 if held.stacks_with(&there)
                     && there.count < limit
-                    && may_place(index, held.item, self.fuel.as_deref()) =>
+                    && may_place(
+                        index,
+                        held.item,
+                        self.fuel.as_deref(),
+                        self.smithing.as_deref(),
+                    ) =>
             {
                 let moved = held.count.min(limit - there.count);
                 there.count += moved;
@@ -1423,7 +1749,13 @@ impl Inventory {
             // Swap, if the slot will take what is on the cursor and the whole
             // of it fits.
             (Some(held), Some(there)) => {
-                if !may_place(index, held.item, self.fuel.as_deref()) || held.count > limit {
+                if !may_place(
+                    index,
+                    held.item,
+                    self.fuel.as_deref(),
+                    self.smithing.as_deref(),
+                ) || held.count > limit
+                {
                     return;
                 }
                 self.slots[index] = Some(held);
@@ -1447,7 +1779,12 @@ impl Inventory {
             }
             // Hand full, slot empty or the same item with room: put one down.
             (Some(mut held), None) => {
-                if !may_place(index, held.item, self.fuel.as_deref()) {
+                if !may_place(
+                    index,
+                    held.item,
+                    self.fuel.as_deref(),
+                    self.smithing.as_deref(),
+                ) {
                     return;
                 }
                 held.count -= 1;
@@ -1457,7 +1794,12 @@ impl Inventory {
             (Some(mut held), Some(mut there))
                 if held.stacks_with(&there)
                     && there.count < slot_limit(index, held.item)
-                    && may_place(index, held.item, self.fuel.as_deref()) =>
+                    && may_place(
+                        index,
+                        held.item,
+                        self.fuel.as_deref(),
+                        self.smithing.as_deref(),
+                    ) =>
             {
                 held.count -= 1;
                 there.count += 1;
@@ -1465,8 +1807,12 @@ impl Inventory {
                 self.cursor = (held.count > 0).then_some(held);
             }
             (Some(held), Some(there)) => {
-                if !may_place(index, held.item, self.fuel.as_deref())
-                    || held.count > slot_limit(index, held.item)
+                if !may_place(
+                    index,
+                    held.item,
+                    self.fuel.as_deref(),
+                    self.smithing.as_deref(),
+                ) || held.count > slot_limit(index, held.item)
                 {
                     return;
                 }
@@ -1680,7 +2026,50 @@ impl Inventory {
                     [Some((MAIN_START..MAIN_END, false)), None]
                 }
             }
+            // `StonecutterMenu.quickMoveStack`, arm for arm. Out of either of
+            // the bench's two slots, into the player's half; out of the
+            // player's half, into the input **if the stonecutter cuts it**,
+            // and only otherwise between the hotbar and the inventory.
+            Window::Stonecutter => {
+                if (CUT_START..CUT_END).contains(&index) {
+                    return [Some((MAIN_START..HOTBAR_END, false)), None];
+                }
+                if self.cut_list_for(item).is_empty() {
+                    if (MAIN_START..MAIN_END).contains(&index) {
+                        return [Some((HOTBAR_START..HOTBAR_END, false)), None];
+                    }
+                    return [Some((MAIN_START..MAIN_END, false)), None];
+                }
+                [Some((CUT_INPUT..CUT_OUTPUT, false)), None]
+            }
+            // `ItemCombinerMenu.quickMoveStack` with `SmithingMenu`'s own
+            // `getSlotToQuickMoveTo`: the **first** of the three input slots
+            // that will take this item, and the player's half if none will.
+            Window::Smithing => {
+                if (SMITH_START..SMITH_END).contains(&index) {
+                    return [Some((MAIN_START..HOTBAR_END, false)), None];
+                }
+                let to = (SMITH_TEMPLATE..SMITH_OUTPUT).find(|&slot| {
+                    may_place(slot, item, self.fuel.as_deref(), self.smithing.as_deref())
+                });
+                if let Some(to) = to {
+                    return [Some((to..SMITH_OUTPUT, false)), None];
+                }
+                if (MAIN_START..MAIN_END).contains(&index) {
+                    [Some((HOTBAR_START..HOTBAR_END, false)), None]
+                } else {
+                    [Some((MAIN_START..MAIN_END, false)), None]
+                }
+            }
         }
+    }
+
+    /// What a stonecutter would cut this item into, without it being in the
+    /// slot yet. The question a shift-click asks.
+    fn cut_list_for(&self, item: Item) -> &[dust_sim::cutting::Cut] {
+        self.cutting
+            .as_ref()
+            .map_or(&[][..], |cutting| cutting.cuts_of(item))
     }
 
     /// Whether the open furnace's fire cooks this item.
@@ -1779,7 +2168,12 @@ impl Inventory {
             }
             return;
         };
-        if !may_place(index, coming.item, self.fuel.as_deref()) {
+        if !may_place(
+            index,
+            coming.item,
+            self.fuel.as_deref(),
+            self.smithing.as_deref(),
+        ) {
             return;
         }
         let limit = slot_limit(index, coming.item);
@@ -1913,13 +2307,17 @@ impl Inventory {
                     self.drag.reset();
                     return;
                 };
-                let fits = may_place(index, held.item, self.fuel.as_deref())
-                    && match self.slots[index].as_ref() {
-                        None => true,
-                        Some(there) => {
-                            there.stacks_with(held) && there.count < slot_limit(index, held.item)
-                        }
-                    };
+                let fits = may_place(
+                    index,
+                    held.item,
+                    self.fuel.as_deref(),
+                    self.smithing.as_deref(),
+                ) && match self.slots[index].as_ref() {
+                    None => true,
+                    Some(there) => {
+                        there.stacks_with(held) && there.count < slot_limit(index, held.item)
+                    }
+                };
                 if fits {
                     self.drag.add(index);
                 }
@@ -1956,7 +2354,7 @@ impl Inventory {
         }
         let mut left = held.count;
         for index in 0..SLOTS {
-            if self.drag.slots & (1u64 << index) == 0 {
+            if self.drag.slots & (1u128 << index) == 0 {
                 continue;
             }
             let existing = self.slots[index].as_ref().map_or(0, |s| s.count);
@@ -2120,7 +2518,14 @@ impl Inventory {
             return;
         }
         for index in (0..steps).map(at) {
-            if self.slots[index].is_some() || !may_place(index, stack.item, self.fuel.as_deref()) {
+            if self.slots[index].is_some()
+                || !may_place(
+                    index,
+                    stack.item,
+                    self.fuel.as_deref(),
+                    self.smithing.as_deref(),
+                )
+            {
                 continue;
             }
             let moved = stack.count.min(slot_limit(index, stack.item));
@@ -3195,14 +3600,14 @@ mod tests {
         assert_eq!(worn_in(item("minecraft:carved_pumpkin")), Some(ARMOUR_HEAD));
         assert_eq!(worn_in(stone()), None);
 
-        assert!(may_place(ARMOUR_HEAD, helmet(), None));
-        assert!(!may_place(ARMOUR_HEAD, boots(), None));
-        assert!(!may_place(ARMOUR_FEET, helmet(), None));
-        assert!(!may_place(ARMOUR_HEAD, stone(), None));
+        assert!(may_place(ARMOUR_HEAD, helmet(), None, None));
+        assert!(!may_place(ARMOUR_HEAD, boots(), None, None));
+        assert!(!may_place(ARMOUR_FEET, helmet(), None, None));
+        assert!(!may_place(ARMOUR_HEAD, stone(), None, None));
         // The offhand and the inventory take anything, the output nothing.
-        assert!(may_place(OFFHAND, stone(), None));
-        assert!(may_place(MAIN_START, helmet(), None));
-        assert!(!may_place(CRAFTING_OUTPUT, stone(), None));
+        assert!(may_place(OFFHAND, stone(), None, None));
+        assert!(may_place(MAIN_START, helmet(), None, None));
+        assert!(!may_place(CRAFTING_OUTPUT, stone(), None, None));
     }
 
     #[test]

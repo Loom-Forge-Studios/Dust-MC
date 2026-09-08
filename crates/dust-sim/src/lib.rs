@@ -19,9 +19,11 @@
 
 pub mod cooking;
 pub mod crafting;
+pub mod cutting;
 pub mod drops;
 pub mod mining;
 pub mod placement;
+pub mod smithing;
 pub mod updates;
 
 pub use cooking::{Cooked, Cooking, Fire};

@@ -246,8 +246,15 @@ wire_struct! {
 
 wire_struct! {
     /// Netherite upgrades: template plus base plus addition becomes result.
+    ///
+    /// **No `group`**, unlike every other recipe here. `SmithingTransformRecipe`'s
+    /// stream codec is four fields and the group is not one of them — it is a
+    /// recipe-book grouping that the smithing serialiser never carried. The
+    /// field was here until the first packet was sent to a real client, which
+    /// read the recipe id that followed as a stack's components and gave up on
+    /// the connection; a round trip against this crate's own decoder agreed
+    /// with itself for the whole time it was wrong.
     pub struct SmithingTransformData {
-        group: ProtocolString,
         template: Ingredient,
         base: Ingredient,
         addition: Ingredient,
@@ -257,8 +264,9 @@ wire_struct! {
 
 wire_struct! {
     /// Armor trims: template plus base plus addition, with the result derived.
+    ///
+    /// No `group`, for the reason [`SmithingTransformData`] gives.
     pub struct SmithingTrimData {
-        group: ProtocolString,
         template: Ingredient,
         base: Ingredient,
         addition: Ingredient,

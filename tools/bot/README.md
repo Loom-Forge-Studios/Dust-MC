@@ -168,6 +168,67 @@ empty hand — and requires both to be taken back. 6 of 6 on a real server, 6 of
 path, which is what says the check can fail. Decision record 0033 is this
 script's output, and 0034 is `--table`'s.
 
+## The bench differential
+
+`benches.js` is the two blocks that are not a grid and not a fire: a
+stonecutter and a smithing table.
+
+```
+node benches.js 25703 --survey --out vanilla.json   # a real 1.21.1 server
+node benches.js 25603 --survey --out dust.json
+node benches.js --compare vanilla.json dust.json
+```
+
+**There is no `--check` and there cannot be one.** A stonecutter's buttons are
+an index into a list the *client* built — it filters every stonecutting recipe
+it was told about by what is in the input slot, sorts the survivors, and sends
+back a position in that list. Neither end puts the order on the wire, so there
+is no answer a single server can give that this script could read as wrong. A
+guess would be invisible: Dust would agree with itself all day and hand the
+player a wall when they pressed stairs.
+
+So the survey presses **all 24 button ids on six inputs** and writes down what
+came out of each, and the comparison is the measurement. The order turns out to
+be the result item's **description id** — not the recipe id and not the order
+the recipes arrive in. A real server sends
+`diorite_wall_from_diorite_stonecutting` first in `declare_recipes` and draws
+`andesite_slab` on button 0. `stone_brick_wall` on button 3 and `stone_bricks`
+on button 4 is the pair that says the comparison is over bytes.
+
+Pressing 24 rather than as many buttons as the input has is not padding: a
+press outside the list leaves the **last** selection standing on a real server
+rather than clearing it, so the eighteen presses that appear to do nothing are
+themselves a measurement.
+
+The button rows are compared as **whole sequences**. Not as counts and not as
+sets — the order is the thing under test and both weaker forms pass a server
+that sorted differently.
+
+A smithing table is the opposite trap. Its result is decided by the server and
+there is no button, but the vanilla client computes the same result out of the
+same recipe list and clears its own result slot whenever an input changes — so
+a server that never sent the smithing recipes looks right in a packet log and
+is empty on the screen. One survey row upgrades a diamond chestplate named
+"Old Faithful" with 137 damage on it, because vanilla's `transmuteCopy` carries
+the base stack's components onto the result and a server that built a fresh
+netherite chestplate would pass every check that compared item names.
+
+**17 of 17 rows agree, with 2 declared divergences**, both of them the same
+fact from two ends: Dust does not load the eighteen `smithing_trim` recipes, so
+it declares 9 smithing recipes where a real server declares 27, and its base
+slot bounces the iron chestplate vanilla accepts for a trim. Both are named in
+the script with their reason, and a **named divergence that stops diverging
+fails too** — the day somebody loads the trims, this says so instead of quietly
+agreeing with a record that has gone stale.
+
+It also caught a wire bug that nothing in the Rust suite could. Dust wrote a
+`group` string at the head of every `smithing_transform`, like every other
+recipe in `update_recipes` — and smithing recipes have never had one.
+`SmithingTransformRecipe`'s stream codec is four fields. A round trip agreed
+with itself for as long as the field was there; mineflayer, which shares no
+code with this project, read the recipe id after the body as a component patch
+and gave up. Decision record 0037 is this script's output.
+
 ## The equipment differential
 
 `equipment.js` asks a different question again: not what the server told the
