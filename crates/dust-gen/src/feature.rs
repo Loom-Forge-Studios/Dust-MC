@@ -1155,6 +1155,26 @@ impl Site<'_> {
         i32::from(self.heights[(column_z as usize) * WINDOW + column_x as usize])
     }
 
+    /// Whether a vein whose whole write box is `base..=base + wide` on both
+    /// horizontal axes can reach the chunk being built.
+    ///
+    /// **This decides only whether the write loop runs, never whether a draw
+    /// happens**, which is what makes skipping it exact rather than an
+    /// approximation. The only draw inside that loop is `OreFeature`'s
+    /// air-exposure chance, and it is reached only through
+    /// [`Site::index`] — which already answers `None` for every cell outside
+    /// this chunk. A vein that cannot reach the chunk therefore draws nothing
+    /// whether the loop runs or not, and eight of every nine origins are
+    /// neighbours whose veins mostly cannot.
+    fn reaches(&self, base_x: i32, base_z: i32, wide: i32) -> bool {
+        let low_x = self.centre_x * 16;
+        let low_z = self.centre_z * 16;
+        base_x <= low_x + 15
+            && base_x + wide >= low_x
+            && base_z <= low_z + 15
+            && base_z + wide >= low_z
+    }
+
     /// The index into the chunk's material buffer, or `None` when the cell is
     /// outside the chunk being built or outside the world.
     fn index(&self, x: i32, y: i32, z: i32) -> Option<usize> {
@@ -1420,6 +1440,12 @@ fn place_ore(
                 }
             }
         }
+    }
+
+    // Every cell this vein could write is outside the chunk being built, and
+    // the loop below would draw nothing for any of them. See `Site::reaches`.
+    if !site.reaches(base_x, base_z, wide) {
+        return;
     }
 
     // Vanilla's `BitSet` is allocated `wide * tall * wide` and then indexed

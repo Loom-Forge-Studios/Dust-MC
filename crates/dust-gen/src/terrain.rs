@@ -837,20 +837,104 @@ impl<'a> Columns<'a> {
         if self.placer.is_none() {
             return self.carve(chunk_x, chunk_z);
         }
-        let cells = self.materials.len();
         let mut materials = std::mem::take(&mut self.materials);
         self.carve_into(chunk_x, chunk_z, &mut materials);
+        let window = self.window_heights(chunk_x, chunk_z, &materials);
+        self.place_into(chunk_x, chunk_z, &mut materials, &window);
+        self.materials = materials;
+        self.window = window;
+        &self.materials
+    }
 
+    /// `OCEAN_FLOOR_WG` for one chunk, which costs that chunk's whole terrain.
+    ///
+    /// Public because a caller that builds columns in an order this scratch's
+    /// own cache cannot follow is better off keeping the answers itself. A join
+    /// streams its columns nearest-first, spiralling out from the player; the
+    /// cache here is five rows deep and direct-mapped, which is exactly right
+    /// for a scan and thrashes on a spiral, and a thrashing cache means
+    /// twenty-five terrain fills for every column served rather than one.
+    /// 512 bytes per chunk, kept beside the sky floors a server already keeps,
+    /// is what that costs instead.
+    pub fn ocean_floor_heights(&mut self, chunk_x: i32, chunk_z: i32) -> [i16; 256] {
+        let mut column = [0i16; 256];
+        let cells = self.materials.len();
+        let mut spare = std::mem::take(&mut self.spare);
+        if spare.len() != cells {
+            spare.resize(cells, 0);
+        }
+        // A chunk built only to be measured is not this chunk's carving, for
+        // the same reason the window fills below are not.
+        let carved = self.cutter.as_ref().map(crate::carver::Cutter::counts);
+        let declined = self.painter.as_ref().map(crate::surface::Painter::declined);
+        self.carve_into(chunk_x, chunk_z, &mut spare);
+        if let Some(features) = self.placer.as_ref().map(crate::feature::Placer::features) {
+            features.column_heights(&spare, &mut column);
+        }
+        self.restore_counts(carved, declined);
+        self.spare = spare;
+        column
+    }
+
+    /// The whole of [`Columns::features`] except for finding the column
+    /// heights, which the caller has already found.
+    ///
+    /// `window` is `OCEAN_FLOOR_WG` over the [`crate::feature::WINDOW`] by
+    /// [`crate::feature::WINDOW`] columns centred on this chunk, row-major from
+    /// the north-west corner of the chunk [`crate::feature::WINDOW_RADIUS`] to
+    /// the north and west — twenty-five chunks of what
+    /// [`Columns::ocean_floor_heights`] answers, laid side by side.
+    pub fn features_over(&mut self, chunk_x: i32, chunk_z: i32, window: &[i16]) -> &[u8] {
+        if self.placer.is_none() {
+            return self.carve(chunk_x, chunk_z);
+        }
+        let mut materials = std::mem::take(&mut self.materials);
+        self.carve_into(chunk_x, chunk_z, &mut materials);
+        self.place_into(chunk_x, chunk_z, &mut materials, window);
+        self.materials = materials;
+        &self.materials
+    }
+
+    fn place_into(&mut self, chunk_x: i32, chunk_z: i32, materials: &mut [u8], window: &[i16]) {
+        if let Some(placer) = self.placer.as_mut() {
+            placer.place(
+                chunk_x,
+                chunk_z,
+                materials,
+                window,
+                &mut self.biomes,
+                self.zoom_seed,
+            );
+        }
+    }
+
+    fn restore_counts(
+        &mut self,
+        carved: Option<crate::carver::Counts>,
+        declined: Option<(u64, u64)>,
+    ) {
+        if let (Some(cutter), Some(counts)) = (self.cutter.as_mut(), carved) {
+            cutter.set_counts(counts);
+        }
+        if let (Some(painter), Some(counts)) = (self.painter.as_mut(), declined) {
+            painter.set_declined(counts);
+        }
+    }
+
+    /// The window of column heights this chunk's features read, off this
+    /// scratch's own five-row cache, given the chunk's own materials.
+    fn window_heights(&mut self, chunk_x: i32, chunk_z: i32, materials: &[u8]) -> Vec<i16> {
         // The counts belong to the chunk being built. The twenty-four fills
         // below are scaffolding for a heightmap and would otherwise be reported
         // as this chunk's carving.
         let carved = self.cutter.as_ref().map(crate::carver::Cutter::counts);
         let declined = self.painter.as_ref().map(crate::surface::Painter::declined);
 
+        let cells = materials.len();
         let radius = crate::feature::WINDOW_RADIUS;
         let mut column = [0i16; 256];
         if let Some(features) = self.placer.as_ref().map(crate::feature::Placer::features) {
-            features.column_heights(&materials, &mut column);
+            features.column_heights(materials, &mut column);
         }
         self.heights.put(chunk_x, chunk_z, &column);
         let mut spare = std::mem::take(&mut self.spare);
@@ -871,16 +955,12 @@ impl<'a> Columns<'a> {
             }
         }
         self.spare = spare;
-        if let (Some(cutter), Some(counts)) = (self.cutter.as_mut(), carved) {
-            cutter.set_counts(counts);
-        }
-        if let (Some(painter), Some(counts)) = (self.painter.as_mut(), declined) {
-            painter.set_declined(counts);
-        }
+        self.restore_counts(carved, declined);
 
         let width = crate::feature::WINDOW;
-        self.window.clear();
-        self.window.resize(width * width, 0);
+        let mut window = std::mem::take(&mut self.window);
+        window.clear();
+        window.resize(width * width, 0);
         for offset_z in -radius..=radius {
             for offset_x in -radius..=radius {
                 let heights = self
@@ -891,24 +971,12 @@ impl<'a> Columns<'a> {
                 let base_z = ((offset_z + radius) * 16) as usize;
                 for local_z in 0..16usize {
                     let row = (base_z + local_z) * width + base_x;
-                    self.window[row..row + 16]
+                    window[row..row + 16]
                         .copy_from_slice(&heights[local_z * 16..local_z * 16 + 16]);
                 }
             }
         }
-
-        if let Some(placer) = self.placer.as_mut() {
-            placer.place(
-                chunk_x,
-                chunk_z,
-                &mut materials,
-                &self.window,
-                &mut self.biomes,
-                self.zoom_seed,
-            );
-        }
-        self.materials = materials;
-        &self.materials
+        window
     }
 
     /// What this chunk's feature stage did, or `None` when the dimension runs

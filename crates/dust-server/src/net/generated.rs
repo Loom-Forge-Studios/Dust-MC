@@ -106,6 +106,20 @@ pub struct GeneratedWorld {
     default_biome: u32,
     biome_registry_size: u32,
     floors: Mutex<HashMap<(i32, i32), SkyFloor>>,
+    /// `OCEAN_FLOOR_WG` per generated chunk, which is what the feature stage
+    /// reads before it draws a vein.
+    ///
+    /// Kept here rather than in the generator's own scratch because of the
+    /// *order* a join builds columns in. A vein whose origin is two chunks away
+    /// still reaches in, so every column served asks about the 5x5 window
+    /// around it, and the only way to answer for a chunk is to build its
+    /// terrain. The scratch's own cache is five rows deep and direct-mapped:
+    /// right for a scan, useless for the nearest-first spiral a join streams
+    /// in, which made every column pay twenty-five terrain fills instead of
+    /// one — 128 ms a column, 37 s for a 289-column join. A shared map keyed by
+    /// position turns that back into one fill per chunk of the region, at
+    /// 512 bytes each.
+    heights: Mutex<HashMap<(i32, i32), [i16; 256]>>,
 }
 
 impl GeneratedWorld {
@@ -147,6 +161,7 @@ impl GeneratedWorld {
             default_biome,
             biome_registry_size,
             floors: Mutex::new(HashMap::new()),
+            heights: Mutex::new(HashMap::new()),
         })
     }
 
@@ -228,7 +243,8 @@ impl GeneratedWorld {
         let top = min_y + self.height.height() as i32;
         {
             let materials = if with_biomes {
-                columns.features(pos.x, pos.z)
+                let window = self.window_heights(&mut columns, pos);
+                columns.features_over(pos.x, pos.z, &window)
             } else {
                 columns.terrain(pos.x, pos.z)
             };
@@ -281,6 +297,58 @@ impl GeneratedWorld {
             self.constants.as_deref(),
         ));
         chunk
+    }
+
+    /// `OCEAN_FLOOR_WG` over the window the feature stage reads, out of the
+    /// shared cache, building only the chunks nothing has built yet.
+    fn window_heights(
+        &self,
+        columns: &mut dust_gen::terrain::Columns<'_>,
+        pos: ChunkPos,
+    ) -> Vec<i16> {
+        let radius = dust_gen::feature::WINDOW_RADIUS;
+        let width = dust_gen::feature::WINDOW;
+        let mut window = vec![0i16; width * width];
+        for offset_z in -radius..=radius {
+            for offset_x in -radius..=radius {
+                let (near_x, near_z) = (pos.x + offset_x, pos.z + offset_z);
+                let heights = self.chunk_heights(columns, near_x, near_z);
+                let base_x = ((offset_x + radius) * 16) as usize;
+                let base_z = ((offset_z + radius) * 16) as usize;
+                for local_z in 0..16usize {
+                    let row = (base_z + local_z) * width + base_x;
+                    window[row..row + 16]
+                        .copy_from_slice(&heights[local_z * 16..local_z * 16 + 16]);
+                }
+            }
+        }
+        window
+    }
+
+    fn chunk_heights(
+        &self,
+        columns: &mut dust_gen::terrain::Columns<'_>,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> [i16; 256] {
+        if let Some(held) = self
+            .heights
+            .lock()
+            .expect("the height map is never poisoned")
+            .get(&(chunk_x, chunk_z))
+        {
+            return *held;
+        }
+        let heights = columns.ocean_floor_heights(chunk_x, chunk_z);
+        let mut cache = self
+            .heights
+            .lock()
+            .expect("the height map is never poisoned");
+        if cache.len() >= SKY_FLOOR_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert((chunk_x, chunk_z), heights);
+        heights
     }
 
     /// Where the sky reaches in a *neighbouring* column, remembered.
