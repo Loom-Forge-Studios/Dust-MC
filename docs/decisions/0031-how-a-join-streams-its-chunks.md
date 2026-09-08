@@ -195,6 +195,17 @@ number that matters — when the loading screen ends — is already 25 columns a
 not 289. Declined on priority 2 with priority 1 satisfied, and the last section
 says what would reopen it.
 
+**Built by [D36](0036-how-many-threads-build-the-world.md), 2026-09-07**, and
+what reopened it is in this record's own last section: "`STREAM_BATCH` is now a
+bound on the region case only. On a generated world the store cannot build eight
+columns in twenty milliseconds, so the stream is paced by the builder and the
+batch size does nothing." With four builders it is again. A single generated
+join's last column arrives at 1,069 ms against 2,699 — 108 ms off a world with
+nothing left to build — and four simultaneous joins at 5,584 against 17,202. The
+estimate above was optimistic by a little and right in shape: four builders take
+a single join to 2.5x and to the end of its curve, and it is *four simultaneous*
+joins that would still take more threads.
+
 **Moving the encode off the session task too.** 5.8 ms across 289 columns, and
 it would put the socket write behind another hop.
 

@@ -170,6 +170,15 @@ buying a thing that has already stopped being the constraint, at the price of
 cores the tick loop wants. It should be reconsidered when something measures
 what the residual stall is, and not before.
 
+**Built by [D36](0036-how-many-threads-build-the-world.md), 2026-09-07.** The
+condition was met from an unexpected direction: what got measured was not the
+bystander's residual stall but the *joining* player's own wait, which nothing
+had ever instrumented. `benches/warming.rs` runs the stream's own discipline
+against the store and counts the 20 ms passes that had nothing ready to send —
+273 of them on a single join with one builder, 19 with four. This record and
+D42 are both right that the build was no longer what a *bystander* waited for;
+neither had asked what the joiner waited for.
+
 **A mutex per region file** instead of one over the map. It would help four
 players spread across a world and not the case under test, where four joiners
 at the same spawn want the same file. The measurement to justify it is four

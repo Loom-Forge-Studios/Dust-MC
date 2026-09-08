@@ -37,6 +37,11 @@
 //! remembered, exactly as [`super::source::AnvilWorld`] remembers the floors it
 //! reads. Each position's floor is then computed once: a view distance of
 //! eight is 289 columns and 72 more around its edge, not 289 times four.
+//!
+//! **The cache has exactly one writer**, [`GeneratedWorld::sky_floor`], and
+//! that is what makes a generated world a function of its seed rather than of
+//! the order its columns were built in. Decision record 0036 has the 15
+//! columns in 900 that said so.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -162,11 +167,20 @@ impl GeneratedWorld {
     }
 
     /// One column, blocks, biomes, heightmaps and light.
+    ///
+    /// **This column's own floors are deliberately not put in the cache.** They
+    /// were, for one line and one stated reason — "so a scan pays for each
+    /// position once" — and that line made a generated world depend on the
+    /// order it was built in. The floor of a *carved* column is not the floor
+    /// of the same column's terrain, so whether the cache held one or the other
+    /// depended on whether a neighbour had been built as a column yet, and the
+    /// answer to that is a race as soon as more than one thread builds. Two
+    /// worlds on seed 1, one reaching each column cold and one reaching it with
+    /// its four neighbours already built, **disagreed on 15 of 900 columns**.
+    /// See [`Self::sky_floor`], which is now the only writer, and decision
+    /// record 0036.
     pub fn column(&self, pos: ChunkPos) -> Chunk {
         let mut chunk = self.build(pos, true);
-        // This column's own floors go in before its neighbours are asked for
-        // theirs, so a scan pays for each position once.
-        self.remember(pos, SkyFloor::of(&chunk));
         let skirt = Skirt {
             west: self.sky_floor(ChunkPos::new(pos.x - 1, pos.z)),
             east: self.sky_floor(ChunkPos::new(pos.x + 1, pos.z)),
@@ -187,6 +201,19 @@ impl GeneratedWorld {
     /// sky floor is the same before and after. The exception is the handful of
     /// rules that write air into a hole in a frozen ocean floor, which is one
     /// block of sky reach on a world of them.
+    ///
+    /// **The carvers go with them, and that one is an approximation rather than
+    /// a free lunch.** A ravine that breaks a neighbour's surface lowers where
+    /// its sky reaches by tens of blocks, and this skirt does not see it, so
+    /// light crossing that seam is the light of an uncarved neighbour. It is
+    /// the same approximation on every column rather than on whichever ones a
+    /// build order happened to reach first, which is what makes the world a
+    /// function of its seed again. Costed against the accurate alternative in
+    /// one interleaved run: handing the skirt a fully carved neighbour is
+    /// **1.5x to 2.1x** a join's whole generation, and being deterministic at
+    /// all costs between **-6% and +8%**. Decision record 0036 has the table,
+    /// declines the carved skirt here, and hands the accuracy question to the
+    /// light oracle, which has never been pointed at generated terrain.
     fn build(&self, pos: ChunkPos, with_biomes: bool) -> Chunk {
         let mut chunk = Chunk::uniform(
             pos,
@@ -256,6 +283,14 @@ impl GeneratedWorld {
         chunk
     }
 
+    /// Where the sky reaches in a *neighbouring* column, remembered.
+    ///
+    /// **The only writer of the cache, and that is the invariant rather than a
+    /// tidiness.** A memo may hold one function's answers; this one held two —
+    /// this terrain-only floor and, from [`Self::column`], the floor of the
+    /// same column after carving — and which of them a reader got was decided
+    /// by whichever thread arrived first. One writer means the key has one
+    /// meaning, and a builder pool cannot change what a seed generates.
     fn sky_floor(&self, pos: ChunkPos) -> SkyFloor {
         if let Some(held) = self
             .floors
@@ -266,16 +301,12 @@ impl GeneratedWorld {
             return *held;
         }
         let floors = SkyFloor::of(&self.build(pos, false));
-        self.remember(pos, floors);
-        floors
-    }
-
-    fn remember(&self, pos: ChunkPos, floors: SkyFloor) {
         let mut cache = self.floors.lock().expect("the floor map is never poisoned");
         if cache.len() >= SKY_FLOOR_CACHE_CAP {
             cache.clear();
         }
         cache.insert((pos.x, pos.z), floors);
+        floors
     }
 }
 

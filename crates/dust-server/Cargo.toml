@@ -82,6 +82,10 @@ name = "join"
 harness = false
 
 [[bench]]
+name = "warming"
+harness = false
+
+[[bench]]
 name = "contention"
 harness = false
 
