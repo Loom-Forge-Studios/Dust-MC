@@ -11,8 +11,9 @@
 //!
 //! # What this stage runs, and what it counts instead
 //!
-//! One configured-feature type: `minecraft:ore`. That is thirty of the pack's
-//! one hundred and ninety-six, and it is the whole of the underground-ores
+//! One configured-feature type: `minecraft:ore`. That is thirty of the hundred
+//! and fifty-one a vanilla overworld's biomes name, and it is the whole of the
+//! underground-ores
 //! step — the coal and iron a player needs before anything else, and the tuff,
 //! andesite, diorite and granite that were the four largest single entries in
 //! "Minecraft has where Dust is wrong" the day this was written. Every other
@@ -48,10 +49,38 @@
 //! reaches thirteen blocks. This runs all nine origins and keeps the writes
 //! that land in the middle one, because the alternative is veins sliced flat at
 //! every chunk boundary, which no test would fail and every player would see.
+//!
+//! # Where `[worldgen.ores]` gets in
+//!
+//! [`Features::apply_ore_settings`], after the pack is compiled and before a
+//! chunk is built. The knob is keyed by **ore group**, which is derived from
+//! the block states a placement puts down by
+//! [`crate::ore_density::group`] — the same function `cargo xtask extract`
+//! names its table's groups with, because two implementations of a naming rule
+//! are two chances for `[worldgen.ores.overrides.diamond]` to name nothing.
+//!
+//! **With the defaults nothing here runs at all.** A group whose settings are
+//! the identity keeps the `Vec<Modifier>` the pack was read into, rather than a
+//! rewrite that ought to come out the same. Decision record 0006 asks for that
+//! in those words and 0043 is what it now turns.
+//!
+//! # What this stage still gets wrong, and it is all at the chunk wall
+//!
+//! A vein drawn from a neighbouring origin is drawn against *this* chunk's
+//! blocks, because this chunk's blocks are the only ones built. So
+//! `Feature.isAdjacentToAir` is answered "not air" outside it
+//! ([`Counts::air_outside`] counts every time), and the air-exposure *draw* is
+//! not taken for a cell outside it — which leaves the stream one draw short for
+//! every later attempt of the same feature in that origin. Five of vanilla's
+//! thirty ore placements have a discard chance strictly between 0 and 1, and
+//! the harness sees them as veins one cell over rather than as veins missing.
+//! Decision record 0043 prices the fix at nine times the terrain and declines
+//! it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use dust_config::ore::{OreGroup, OresConfig};
 use serde_json::Value;
 
 use crate::noise::build::{read_json, BlockSpec, BuildError, NoiseSettings};
@@ -149,6 +178,11 @@ struct Target {
     /// The material code written, which is `4 + index` into the combined
     /// palette.
     code: u8,
+    /// The block this target writes, by name. Kept because the ore *group* an
+    /// operator turns a knob on is derived from the blocks a placement puts
+    /// down and from nothing else — see [`crate::ore_density::group`] — and the
+    /// material code has already thrown the name away.
+    placed_name: String,
     /// The blocks the pack's `RuleTest` names, kept until the whole palette is
     /// known and `replaces` can be built over it.
     names: Vec<String>,
@@ -204,7 +238,7 @@ impl Height {
 }
 
 /// One entry of a placed feature's `placement` list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Modifier {
     /// `minecraft:count` with a constant.
     Count(i32),
@@ -212,6 +246,17 @@ enum Modifier {
     CountUniform { min: i32, max: i32 },
     /// `minecraft:rarity_filter`.
     Rarity(i32),
+    /// What `[worldgen.ores]` leaves behind where a `count` or a
+    /// `rarity_filter` was: a whole number of attempts, and a chance of one
+    /// more.
+    ///
+    /// One modifier and not two nested ones, because "three attempts and
+    /// perhaps a fourth" is not "three attempts, each of which perhaps
+    /// happens". It never appears on the identity path — a world running the
+    /// default settings keeps the pack's own [`Modifier::Count`] and
+    /// [`Modifier::Rarity`], so vanilla parity is a matter of the chain never
+    /// having been rewritten rather than of two float expressions agreeing.
+    Attempts { per_chunk: u32, extra: f32 },
     /// `minecraft:in_square`.
     InSquare,
     /// `minecraft:height_range`.
@@ -230,6 +275,18 @@ struct Placed {
     /// `None` when this generator does not run it.
     chain: Option<Vec<Modifier>>,
     ore: Option<Ore>,
+    /// Which ore group this placement belongs to, as an index into
+    /// [`Features::ore_groups`] — the knob `[worldgen.ores]` turns. `None` for
+    /// a placement that is not an ore, or whose blocks name no group.
+    group: Option<u16>,
+    /// What `[worldgen.ores]` made of this placement, when it made anything.
+    ///
+    /// `None` is the identity path and the overwhelmingly common one: the
+    /// pack's own `chain` and `ore` run untouched, so a default world's veins
+    /// are not "arithmetic that came out the same" but the same code that ran
+    /// before this setting existed. D6 requires exactly that, because vanilla
+    /// parity depends on it.
+    scaled: Option<Scaled>,
     /// Whether every biome of the pack names this feature, in which case the
     /// biome filter cannot refuse a position and is not asked.
     ///
@@ -240,6 +297,21 @@ struct Placed {
     /// thirty ores a vanilla overworld runs are named by all fifty-three
     /// biomes.
     everywhere: bool,
+}
+
+/// A placement after `[worldgen.ores]` has been applied to it.
+#[derive(Debug, Clone)]
+enum Scaled {
+    /// The ore is switched off. Nothing is drawn for it at all — not a chain,
+    /// not a position, not a vein of size zero. `setFeatureSeed` re-seeds the
+    /// stream per feature from the chunk's decoration seed and the feature's
+    /// own global index, so a feature that does not run consumes nothing any
+    /// other feature would have drawn.
+    Off,
+    /// The chain and the ore the resolver produced. The pack's own are kept
+    /// beside these and are what a later call resolves from again, so applying
+    /// settings twice is applying them once.
+    On { chain: Vec<Modifier>, ore: Ore },
 }
 
 /// What one chunk's feature stage did, counted rather than assumed.
@@ -260,8 +332,9 @@ pub struct Counts {
     /// Cells refused because the vein's own earlier writes had taken them.
     pub taken: u64,
     /// Times the air-exposure check asked about a cell outside the chunk being
-    /// built, which this generator answers "not air" without looking. See the
-    /// decision record.
+    /// built, which this generator answers "not air" without looking. See
+    /// decision record 0043, which prices building the neighbour and declines
+    /// it.
     pub air_outside: u64,
 }
 
@@ -298,6 +371,11 @@ pub struct Features {
     /// The dimension's own default block, which is the code an ore replaces
     /// most of the time and never reaches the palette.
     default_block: BlockSpec,
+    /// The ore groups this world's own data defines, ascending by name — the
+    /// knobs `[worldgen.ores]` turns. Derived from the block states the
+    /// placements put down, never from a table of vanilla's, so a datapack's
+    /// ores get knobs of their own.
+    ore_groups: Vec<OreGroup>,
     /// Configured-feature types this generator does not run, and how many
     /// placed features name one.
     skipped: BTreeMap<String, usize>,
@@ -435,6 +513,39 @@ impl Features {
                 .iter()
                 .all(|named| named.binary_search(&(index as u32)).is_ok());
         }
+        // The ore groups, from the blocks the placements put down. The rule is
+        // shared with `cargo xtask extract` rather than restated here: the
+        // table it writes and the generator that runs have to agree about which
+        // knob turns which vein, and `[worldgen.ores.overrides.diamond]` naming
+        // nothing is the failure two implementations would produce.
+        let placed_blocks: Vec<Vec<String>> = placed
+            .iter()
+            .map(|entry| {
+                entry.ore.as_ref().map_or_else(Vec::new, |ore| {
+                    let mut names: Vec<String> = ore
+                        .targets
+                        .iter()
+                        .map(|target| target.placed_name.clone())
+                        .collect();
+                    names.sort();
+                    names.dedup();
+                    names
+                })
+            })
+            .collect();
+        let grouping = crate::ore_density::group(&placed_blocks);
+        for (index, slot) in grouping.of_placement.iter().enumerate() {
+            if placed[index].ore.is_none() {
+                continue;
+            }
+            placed[index].group = slot.map(|slot| u16::try_from(slot).unwrap_or(u16::MAX));
+        }
+        let ore_groups: Vec<OreGroup> = grouping
+            .groups
+            .into_iter()
+            .map(|group| group.name)
+            .collect();
+
         let mut biome_sets = Vec::with_capacity(biome_chains.len());
         for named in &biome_chains {
             let mut set = vec![0u64; words].into_boxed_slice();
@@ -451,6 +562,7 @@ impl Features {
             biome_names: biomes.to_vec(),
             by_id: Vec::new(),
             palette: palette_extra,
+            ore_groups,
             ocean_floor: CodeSet::default(),
             ocean_floor_bound: false,
             default_block: settings.default_block.clone(),
@@ -488,6 +600,92 @@ impl Features {
             self.placed.iter().filter(|e| e.chain.is_some()).count(),
             self.placed.len(),
         )
+    }
+
+    /// The ore groups this world defines — the names `[worldgen.ores]` may
+    /// turn a knob on, and the set an unknown override name is checked
+    /// against.
+    pub fn ore_groups(&self) -> BTreeSet<OreGroup> {
+        self.ore_groups.iter().cloned().collect()
+    }
+
+    /// Apply `[worldgen.ores]` to every ore this world generates.
+    ///
+    /// Bound to a loaded configuration rather than compiled with one, for the
+    /// same reason [`Features::bind_biomes`] is bound rather than compiled: the
+    /// pack is one thing and the running server is another. Calling it twice
+    /// resolves twice from the pack, so a reload cannot compound.
+    ///
+    /// **The identity path does not touch the chain.** A group whose settings
+    /// change nothing keeps the `Vec<Modifier>` `read_placed` built, so a
+    /// default world runs the code that ran before this setting existed rather
+    /// than a rewrite that ought to come out the same. D6 asks for that in
+    /// those words, and it is what lets vanilla parity be tested against a
+    /// server with the feature compiled in.
+    pub fn apply_ore_settings(&mut self, config: &OresConfig) -> OreSettings {
+        let mut report = OreSettings::default();
+        for entry in &mut self.placed {
+            entry.scaled = None;
+            let (Some(chain), Some(ore), Some(group)) = (&entry.chain, &entry.ore, entry.group)
+            else {
+                continue;
+            };
+            let Some(name) = self.ore_groups.get(usize::from(group)) else {
+                continue;
+            };
+            if config.resolve_group(name).is_identity() {
+                continue;
+            }
+            let Some(attempts) = baseline_attempts(chain) else {
+                // A `count` this resolver has no vocabulary for — a uniform
+                // provider over anything but 0..=1, whose mean and whose spread
+                // cannot both survive being multiplied. `cargo xtask extract`
+                // refuses the same shape for the same reason. Left exactly as
+                // the pack wrote it, and said out loud: a setting that did
+                // nothing in silence is the outcome D6 calls the worst one
+                // available.
+                report.untouched.push(entry.name.clone());
+                continue;
+            };
+            let baseline = crate::ore_density::Baseline {
+                id: entry.name.clone(),
+                group: name.clone(),
+                attempts,
+                vein_size: ore.size.max(0) as u32,
+                height: baseline_height(chain),
+            };
+            let (resolved, mut notes) = crate::ore_density::resolve_reporting(&baseline, config);
+            report.notes.append(&mut notes);
+            if !resolved.generate {
+                report.disabled.push(entry.name.clone());
+                entry.scaled = Some(Scaled::Off);
+                continue;
+            }
+            let mut scaled_chain = Vec::with_capacity(chain.len() + 1);
+            // The pack always writes `count` or `rarity_filter` first for an
+            // ore, and a placement with neither is one attempt — so the front
+            // is where the resolved attempt count goes in both cases.
+            scaled_chain.push(Modifier::Attempts {
+                per_chunk: resolved.attempts_per_chunk,
+                extra: resolved.extra_attempt_chance as f32,
+            });
+            for modifier in chain {
+                match *modifier {
+                    Modifier::Count(_) | Modifier::CountUniform { .. } | Modifier::Rarity(_) => {}
+                    Modifier::HeightRange(height) => scaled_chain
+                        .push(Modifier::HeightRange(clamp_height(height, resolved.height))),
+                    other => scaled_chain.push(other),
+                }
+            }
+            let mut scaled_ore = ore.clone();
+            scaled_ore.size = i32::try_from(resolved.vein_size).unwrap_or(i32::MAX);
+            report.scaled.push(entry.name.clone());
+            entry.scaled = Some(Scaled::On {
+                chain: scaled_chain,
+                ore: scaled_ore,
+            });
+        }
+        report
     }
 
     /// Point the biome filter at a registry's own ids.
@@ -726,6 +924,8 @@ fn read_placed(
         kind,
         chain,
         ore,
+        group: None,
+        scaled: None,
         everywhere: false,
     })
 }
@@ -893,6 +1093,7 @@ fn read_configured(
         targets.push(Target {
             replaces: CodeSet::default(),
             code,
+            placed_name: spec.name.clone(),
             names,
         });
     }
@@ -1090,8 +1291,13 @@ impl Placer<'_> {
         for (step, list) in features.steps.iter().enumerate() {
             for (position, &which) in list.iter().enumerate() {
                 let entry = &features.placed[which as usize];
-                let (Some(chain), Some(ore)) = (&entry.chain, &entry.ore) else {
-                    continue;
+                let (chain, ore) = match &entry.scaled {
+                    Some(Scaled::Off) => continue,
+                    Some(Scaled::On { chain, ore }) => (chain, ore),
+                    None => match (&entry.chain, &entry.ore) {
+                        (Some(chain), Some(ore)) => (chain, ore),
+                        _ => continue,
+                    },
                 };
                 self.counts.seeded += 1;
                 self.rng.set_feature_seed(
@@ -1190,6 +1396,100 @@ impl Site<'_> {
     }
 }
 
+/// What [`Features::apply_ore_settings`] did, so a boot line can say it.
+///
+/// Four lists rather than a count, because "the settings were applied" and
+/// "the settings were applied to the ore you named" are different claims and
+/// only the second is worth printing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OreSettings {
+    /// Placements whose frequency, vein size or depth the settings changed.
+    pub scaled: Vec<String>,
+    /// Placements switched off, which draw nothing at all.
+    pub disabled: Vec<String>,
+    /// Placements the settings asked to change and this resolver left alone,
+    /// with the reason being that the pack states their frequency in a form
+    /// that has no multiplier. Reported rather than silently obeyed or
+    /// silently ignored.
+    pub untouched: Vec<String>,
+    /// Everything an operator should hear about the result — a vein size
+    /// clamped to what the ore feature can place, a depth range with no room
+    /// left in it.
+    pub notes: Vec<crate::ore_density::Note>,
+}
+
+impl OreSettings {
+    /// Whether the settings changed anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.scaled.is_empty() && self.disabled.is_empty() && self.untouched.is_empty()
+    }
+}
+
+/// How often the pack says this placement is attempted, in the vocabulary the
+/// resolver multiplies.
+///
+/// `None` for a `count` written as a uniform provider over anything but
+/// `0..=1`. That one crosses over exactly — "zero or one attempt, evenly" is
+/// what `RarityFilter { one_in: 2 }` already means — and any other range has
+/// nowhere to land without throwing away either its mean or its spread.
+/// `cargo xtask extract` refuses the same shape, in the same words.
+fn baseline_attempts(chain: &[Modifier]) -> Option<crate::ore_density::Attempts> {
+    use crate::ore_density::Attempts;
+    for modifier in chain {
+        match *modifier {
+            Modifier::Count(n) => return Some(Attempts::PerChunk(n.max(0) as u32)),
+            Modifier::Rarity(n) => {
+                return Some(Attempts::RarityFilter {
+                    one_in: n.max(1) as u32,
+                })
+            }
+            Modifier::CountUniform { min: 0, max: 1 } => {
+                return Some(Attempts::RarityFilter { one_in: 2 })
+            }
+            Modifier::CountUniform { .. } => return None,
+            _ => {}
+        }
+    }
+    // Neither, which is vanilla's own default of one attempt per chunk.
+    Some(Attempts::PerChunk(1))
+}
+
+/// The depths the pack lets this placement generate at.
+///
+/// A chain with no `height_range` offers its feature the world's floor and
+/// nothing else, which is the whole of its range.
+fn baseline_height(chain: &[Modifier]) -> crate::ore_density::HeightRange {
+    for modifier in chain {
+        if let Modifier::HeightRange(height) = *modifier {
+            let (min, max) = match height {
+                Height::Uniform { min, max } | Height::Trapezoid { min, max, .. } => (min, max),
+            };
+            return crate::ore_density::HeightRange::new(min, max);
+        }
+    }
+    crate::ore_density::HeightRange::new(i32::MIN, i32::MAX)
+}
+
+/// Narrow a height provider to the depths the configuration allows.
+///
+/// The *shape* of the distribution is kept: a trapezoid narrowed by a depth
+/// override is still a trapezoid, and its plateau still means what it meant.
+/// Vanilla's own provider handles a plateau wider than the range it is left
+/// with by drawing uniformly, so nothing here has to.
+fn clamp_height(height: Height, range: crate::ore_density::HeightRange) -> Height {
+    match height {
+        Height::Uniform { min, max } => Height::Uniform {
+            min: min.max(range.min_y),
+            max: max.min(range.max_y),
+        },
+        Height::Trapezoid { min, max, plateau } => Height::Trapezoid {
+            min: min.max(range.min_y),
+            max: max.min(range.max_y),
+            plateau,
+        },
+    }
+}
+
 /// Walk one placement chain, depth first, which is the order Java's own lazy
 /// `flatMap` pipeline draws in: a modifier's draws happen when it is asked, and
 /// the whole of the chain below a position runs before the next position is
@@ -1253,6 +1553,44 @@ fn run(
             // A float reciprocal and a strict `<`, both of them vanilla's:
             // `1.0f / 3` is 0.33333334 and not a third.
             if rng.next_f32() < 1.0f32 / chance as f32 {
+                run(
+                    features,
+                    rng,
+                    nodes,
+                    mask,
+                    counts,
+                    chain,
+                    depth + 1,
+                    position,
+                    ore,
+                    site,
+                    biomes,
+                );
+            }
+        }
+        Modifier::Attempts { per_chunk, extra } => {
+            for _ in 0..per_chunk {
+                run(
+                    features,
+                    rng,
+                    nodes,
+                    mask,
+                    counts,
+                    chain,
+                    depth + 1,
+                    position,
+                    ore,
+                    site,
+                    biomes,
+                );
+            }
+            // A chance of zero must not *draw* zero: `next_f32() < 0.0` is
+            // always false and still moves the stream, which would put every
+            // later feature of the step somewhere else. Only a chance that
+            // could go either way costs a draw, which is also what makes an
+            // integer multiplier of an integer count draw exactly what the
+            // pack's own `count` drew.
+            if extra > 0.0 && rng.next_f32() < extra {
                 run(
                     features,
                     rng,
@@ -2169,6 +2507,231 @@ mod tests {
         assert_eq!(
             counts.seeded, 9,
             "nine origins, one feature each: {counts:?}"
+        );
+    }
+
+    // ------------------------------------------------------- [worldgen.ores]
+
+    /// Place one chunk's ore and say how many cells changed.
+    fn placed_cells(features: &Features) -> u64 {
+        let mut placer = features.placer();
+        let (mut materials, heights) = solid_chunk();
+        let (graph, parameters) = nowhere();
+        let mut sampler = crate::biome::Sampler::over(&graph, [0; 6], &parameters);
+        placer.place(0, 0, &mut materials, &heights, &mut sampler, 0);
+        materials.iter().filter(|&&code| code != 1).count() as u64
+    }
+
+    /// The group an operator turns a knob on comes out of the blocks the
+    /// placements put down, and it is the same rule `cargo xtask extract`
+    /// writes into its table. A generator that named this group `coal_ore`
+    /// would leave `[worldgen.ores.overrides.coal]` naming nothing, and the
+    /// server would start.
+    #[test]
+    fn an_ore_is_grouped_by_the_block_it_places() {
+        let (pack, biomes) = one_ore("grouped", 8, 8);
+        let features = compiled(&pack, &biomes);
+        let groups = features.ore_groups();
+        assert_eq!(
+            groups
+                .iter()
+                .map(dust_config::ore::OreGroup::as_str)
+                .collect::<Vec<_>>(),
+            vec!["coal"],
+            "the pack places minecraft:coal_ore and nothing else"
+        );
+    }
+
+    /// **The identity property, as a fact about the chain and not about two
+    /// float expressions agreeing.** D6 requires the default path to be an
+    /// early return, because vanilla parity is tested against a server with
+    /// this setting compiled in.
+    #[test]
+    fn the_default_settings_do_not_touch_the_placement_chain() {
+        let (pack, biomes) = one_ore("identity", 12, 10);
+        let mut features = compiled(&pack, &biomes);
+        let before = features.placed[0].chain.clone();
+        let baseline = placed_cells(&features);
+
+        let report = features.apply_ore_settings(&OresConfig::default());
+        assert!(report.is_empty(), "{report:?}");
+        assert!(
+            features.placed.iter().all(|entry| entry.scaled.is_none()),
+            "the identity path leaves nothing behind to run instead"
+        );
+        assert_eq!(before, features.placed[0].chain, "and changes no modifier");
+        assert_eq!(
+            baseline,
+            placed_cells(&features),
+            "so the world is the same world, cell for cell"
+        );
+    }
+
+    /// `enabled = false` is identity too, which is the switch the parity test
+    /// uses. Proved apart from the default, because "the defaults are
+    /// identity" and "the master switch is identity" are two claims.
+    #[test]
+    fn the_master_switch_off_is_identity_as_well() {
+        let (pack, biomes) = one_ore("master-off", 9, 9);
+        let mut features = compiled(&pack, &biomes);
+        let baseline = placed_cells(&features);
+        let config = OresConfig {
+            enabled: false,
+            default_frequency: 4.0,
+            ..OresConfig::default()
+        };
+        let report = features.apply_ore_settings(&config);
+        assert!(report.is_empty(), "{report:?}");
+        assert_eq!(baseline, placed_cells(&features));
+    }
+
+    /// Turning the knob up puts more ore in the ground, and turning it off
+    /// takes all of it out. The negative half matters as much as the positive
+    /// one: a resolver wired to nothing would pass the first assertion by
+    /// leaving the baseline alone.
+    #[test]
+    fn a_frequency_multiplier_reaches_the_blocks_in_the_ground() {
+        let (pack, biomes) = one_ore("frequency", 4, 8);
+        let mut features = compiled(&pack, &biomes);
+        let baseline = placed_cells(&features);
+        assert!(baseline > 0, "the fixture has to place something");
+
+        let mut features_more = compiled(&pack, &biomes);
+        let more = OresConfig {
+            default_frequency: 4.0,
+            ..OresConfig::default()
+        };
+        let report = features_more.apply_ore_settings(&more);
+        assert_eq!(report.scaled, vec!["minecraft:ore_coal".to_owned()]);
+        assert!(
+            placed_cells(&features_more) > baseline,
+            "four times the attempts has to leave more ore than one"
+        );
+
+        let off = OresConfig {
+            overrides: [(
+                dust_config::ore::OreGroup::new("coal"),
+                dust_config::ore::OreOverride {
+                    enabled: false,
+                    ..dust_config::ore::OreOverride::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..OresConfig::default()
+        };
+        let report = features.apply_ore_settings(&off);
+        assert_eq!(report.disabled, vec!["minecraft:ore_coal".to_owned()]);
+        assert_eq!(
+            placed_cells(&features),
+            0,
+            "an ore switched off leaves no cell behind"
+        );
+    }
+
+    /// A switched-off ore draws **nothing** — it is not run with a count of
+    /// zero. `setFeatureSeed` re-seeds per feature, so this is free of
+    /// consequence for its neighbours, and the count says so.
+    #[test]
+    fn a_disabled_ore_is_not_seeded_at_all() {
+        let (pack, biomes) = one_ore("silent", 6, 6);
+        let mut features = compiled(&pack, &biomes);
+        let config = OresConfig {
+            default_frequency: 0.0,
+            ..OresConfig::default()
+        };
+        features.apply_ore_settings(&config);
+        let mut placer = features.placer();
+        let (mut materials, heights) = solid_chunk();
+        let (graph, parameters) = nowhere();
+        let mut sampler = crate::biome::Sampler::over(&graph, [0; 6], &parameters);
+        placer.place(0, 0, &mut materials, &heights, &mut sampler, 0);
+        assert_eq!(placer.counts().seeded, 0, "{:?}", placer.counts());
+    }
+
+    /// Applying settings twice resolves twice from the pack, never from the
+    /// last answer. A generator that scaled its own scaled chain would triple
+    /// an operator's `frequency = 3.0` on the second reload.
+    #[test]
+    fn applying_settings_twice_applies_them_once() {
+        let (pack, biomes) = one_ore("twice", 5, 8);
+        let mut features = compiled(&pack, &biomes);
+        let config = OresConfig {
+            default_frequency: 3.0,
+            ..OresConfig::default()
+        };
+        features.apply_ore_settings(&config);
+        let once = placed_cells(&features);
+        features.apply_ore_settings(&config);
+        assert_eq!(once, placed_cells(&features));
+
+        // And going back to the defaults goes back to the baseline rather than
+        // staying where it was left.
+        let untouched = compiled(&pack, &biomes);
+        features.apply_ore_settings(&OresConfig::default());
+        assert_eq!(placed_cells(&features), placed_cells(&untouched));
+    }
+
+    /// A vein-size multiplier past what `OreFeature` can place is clamped, and
+    /// the clamp is said out loud rather than happening in silence.
+    #[test]
+    fn a_vein_scaled_past_the_maximum_is_clamped_and_reported() {
+        let (pack, biomes) = one_ore("clamped", 3, 40);
+        let mut features = compiled(&pack, &biomes);
+        let config = OresConfig {
+            overrides: [(
+                dust_config::ore::OreGroup::new("coal"),
+                dust_config::ore::OreOverride {
+                    vein_size: Some(4.0),
+                    ..dust_config::ore::OreOverride::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..OresConfig::default()
+        };
+        let report = features.apply_ore_settings(&config);
+        assert!(
+            report.notes.iter().any(|note| matches!(
+                note,
+                crate::ore_density::Note::VeinSizeClamped { used, .. }
+                    if *used == crate::ore_density::MAX_VEIN_SIZE
+            )),
+            "{:?}",
+            report.notes
+        );
+        let Some(Scaled::On { ore, .. }) = &features.placed[0].scaled else {
+            panic!("the placement was scaled");
+        };
+        assert_eq!(ore.size, crate::ore_density::MAX_VEIN_SIZE as i32);
+    }
+
+    /// A depth override narrows the ore's own range rather than replacing it,
+    /// and it reaches the height provider the chain draws from.
+    #[test]
+    fn a_depth_override_narrows_the_range_the_chain_draws_from() {
+        let (pack, biomes) = one_ore("depth", 3, 8);
+        let mut features = compiled(&pack, &biomes);
+        let config = OresConfig {
+            overrides: [(
+                dust_config::ore::OreGroup::new("coal"),
+                dust_config::ore::OreOverride {
+                    min_y: Some(0),
+                    max_y: Some(10),
+                    ..dust_config::ore::OreOverride::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..OresConfig::default()
+        };
+        features.apply_ore_settings(&config);
+        let Some(Scaled::On { chain, .. }) = &features.placed[0].scaled else {
+            panic!("the placement was scaled");
+        };
+        assert!(
+            chain.contains(&Modifier::HeightRange(Height::Uniform { min: 0, max: 10 })),
+            "{chain:?}"
         );
     }
 

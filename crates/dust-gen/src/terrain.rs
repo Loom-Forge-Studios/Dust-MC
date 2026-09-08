@@ -657,6 +657,34 @@ impl Generator {
         unbound
     }
 
+    /// The ore groups this world's own data defines — the names an operator may
+    /// write under `[worldgen.ores.overrides]`, and the set an unknown one is
+    /// checked against.
+    pub fn ore_groups(&self) -> std::collections::BTreeSet<dust_config::ore::OreGroup> {
+        match &self.features {
+            Some(features) => features.ore_groups(),
+            None => std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Apply `[worldgen.ores]` to this world's ores.
+    ///
+    /// Separate from [`Generator::new`] for the reason every other `bind` here
+    /// is: the pack is the operator's data and the settings are the operator's
+    /// file, and a generator that took them together could not be built from
+    /// one without the other. With the defaults it changes nothing at all, and
+    /// changes it by not running rather than by arithmetic — see decision
+    /// record 0006.
+    pub fn apply_ore_settings(
+        &mut self,
+        config: &dust_config::ore::OresConfig,
+    ) -> crate::feature::OreSettings {
+        match self.features.as_mut() {
+            Some(features) => features.apply_ore_settings(config),
+            None => crate::feature::OreSettings::default(),
+        }
+    }
+
     /// The dimension's surface rules, or `None` if its settings carry none.
     pub fn surface(&self) -> Option<&crate::surface::Rules> {
         self.terrain.router().surface.as_ref()

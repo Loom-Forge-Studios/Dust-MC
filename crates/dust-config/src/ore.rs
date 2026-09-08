@@ -516,7 +516,11 @@ mod tests {
 
     // What these tests do not catch: nothing here proves an ore actually
     // generates. Every assertion above is about precedence and validation, and
-    // the resolver in `dust-gen` is where the numbers become placements. The
-    // test that would catch generation being wrong is the Phase 6 seed-for-seed
-    // differential against a real vanilla server, and it does not exist yet.
+    // `dust_gen::ore_density` is where the numbers become placements —
+    // `dust_gen::feature` is where the placements become blocks, and its own
+    // tests are the ones that dig a chunk up and count. The test that would
+    // catch generation being wrong seed for seed is the Phase 6 differential
+    // against a real vanilla server, and that still does not exist; what does
+    // exist is `cargo xtask harness worldgen`, which scores Dust's own chunks
+    // against Minecraft's and says how far apart the ore is.
 }

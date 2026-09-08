@@ -21,11 +21,17 @@
 //! to walk rather than somewhere to drown. Decision records 0032, 0035 and
 //! 0039 are what each of those is worth.
 //!
-//! What is still missing is **features and structures** — no trees, no ore
-//! veins, no mineshafts, no villages. Record 0039 prices what is left: 97.3%
-//! of the cells Minecraft carved on seed 0's sample are open here too, and the
-//! 18,433 that are not are mostly things something *built*, not something a
-//! carver dug.
+//! `dust_gen::feature` then places what the biomes in view name, which today is
+//! `minecraft:ore` and nothing else — so a player who digs finds coal, iron,
+//! copper, gold, redstone, lapis, diamond and emerald where Minecraft put them,
+//! in among the tuff, andesite, diorite and granite the same feature type
+//! places. `[worldgen.ores]` is applied to those placements at boot; with the
+//! defaults it is applied by not running, which is what decision record 0006
+//! asks for and what lets vanilla parity be tested against a server that has
+//! the setting compiled in.
+//!
+//! What is still missing is **trees, plants and structures** — no oaks, no
+//! grass, no mineshafts, no villages. Record 0043 prices what is left.
 //!
 //! # Why the light needs the four columns around it
 //!
@@ -413,6 +419,7 @@ pub fn beside(
     default_biome: u32,
     biome_registry_size: u32,
     constants: Option<std::sync::Arc<dust_registry::BlockConstants>>,
+    ores: &dust_config::ore::OresConfig,
 ) -> Result<Option<(GeneratedWorld, Report)>, String> {
     let table = data_path.join(dust_gen::biome::FILE);
     let text = match std::fs::read_to_string(&table) {
@@ -465,6 +472,19 @@ pub fn beside(
     ));
     unbound.sort();
     unbound.dedup();
+    // `[worldgen.ores]`, applied to the ores this world actually has rather
+    // than to a table of vanilla's. Two things happen here and they are
+    // different: a name the world has never heard of is an error naming the
+    // nearest match, which is the check D6 says cannot be done until a world is
+    // loaded; and the settings themselves are applied, which with the defaults
+    // means nothing is applied at all and the pack's own placements run.
+    let ore_groups = generator.ore_groups();
+    let unknown_ores: Vec<String> = ores
+        .validate_against(&ore_groups, "worldgen.ores")
+        .into_iter()
+        .map(|finding| format!("{}: {}", finding.path, finding.message))
+        .collect();
+    let ore_settings = generator.apply_ore_settings(ores);
     let surface_blocks = generator.surface().map_or(0, |rules| rules.palette().len());
     let features = generator
         .features()
@@ -491,6 +511,9 @@ pub fn beside(
             default_fluid: settings.default_fluid.name,
             surface_blocks,
             features,
+            ore_groups: ore_groups.len(),
+            ore_settings,
+            unknown_ores,
             unbound,
         },
     )))
@@ -513,6 +536,16 @@ pub struct Report {
     /// altogether. `(0, 0)` means no feature runs -- either the pack names none
     /// this generator knows, or nothing answered for `OCEAN_FLOOR_WG`.
     pub features: (usize, usize),
+    /// How many ore groups this world's data defines — the knobs
+    /// `[worldgen.ores]` may turn.
+    pub ore_groups: usize,
+    /// What `[worldgen.ores]` did to them, which with the defaults is nothing.
+    pub ore_settings: dust_gen::feature::OreSettings,
+    /// `[worldgen.ores.overrides]` entries naming an ore this world does not
+    /// generate, each with the nearest name it does. An operator who wrote one
+    /// has a server that started and a setting that did nothing, which is the
+    /// outcome decision record 0006 calls the worst available.
+    pub unknown_ores: Vec<String>,
     /// Biomes the rules ask about that this registry does not have.
     pub unbound: Vec<String>,
 }
@@ -538,6 +571,26 @@ impl Report {
                 " — and {} biome(s) have moved since the table was written: {}",
                 self.moved.len(),
                 self.moved.join(", ")
+            ));
+        }
+        if !self.ore_settings.is_empty() {
+            let settings = &self.ore_settings;
+            line.push_str(&format!(
+                " — and [worldgen.ores] over {} ore group(s) scaled {}, switched off {}                  and left {} alone",
+                self.ore_groups,
+                settings.scaled.len(),
+                settings.disabled.len(),
+                settings.untouched.len()
+            ));
+            for note in &settings.notes {
+                line.push_str(&format!(" — {note}"));
+            }
+        }
+        if !self.unknown_ores.is_empty() {
+            line.push_str(&format!(
+                " — and {} ore setting(s) name nothing this world generates: {}",
+                self.unknown_ores.len(),
+                self.unknown_ores.join("; ")
             ));
         }
         if !self.unbound.is_empty() {

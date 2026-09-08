@@ -32,6 +32,8 @@
 //! [`crate::vanilla_ores`] over vanilla's real ones. Any change here that breaks
 //! it is a change that breaks vanilla parity.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use dust_config::ore::{OreGroup, OresConfig};
 
 /// The vertical span an ore may generate in, inclusive at both ends.
@@ -261,6 +263,185 @@ fn identity(baseline: &Baseline) -> Resolved {
         extra_attempt_chance,
         vein_size: baseline.vein_size,
         height: baseline.height,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grouping
+// ---------------------------------------------------------------------------
+
+/// One ore group as a world's own data defines it: a knob, and the placements
+/// it turns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    pub name: OreGroup,
+    /// Every block state the group's placements put down, sorted and deduped.
+    /// The name was derived from these, so the reason for it is on the page.
+    pub targets: Vec<String>,
+    /// Indices into the slice [`group`] was given, ascending.
+    pub placements: Vec<usize>,
+}
+
+/// What [`group`] made of a world's ore placements.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Grouping {
+    /// The groups, ascending by name.
+    pub groups: Vec<Group>,
+    /// The group each placement landed in, as an index into `groups`. `None`
+    /// for a placement whose blocks yield no usable name — reported rather
+    /// than dropped, because an ore with no knob is a thing an operator should
+    /// hear about rather than discover.
+    pub of_placement: Vec<Option<usize>>,
+    /// Placements that share *some* but not all of their target blocks with
+    /// another placement in the same group. See [`group`].
+    pub overlapping: Vec<usize>,
+}
+
+/// Gather ore placements into the groups D6 keys its knob by, from the block
+/// states they place and from nothing else.
+///
+/// Two placements are the same ore when they put down a block in common, taken
+/// transitively — which is what makes vanilla's four diamond placements one
+/// `diamond`. The rule is the data's and not a table's, so it is right on a
+/// datapack world as well as a vanilla one, and it lives here rather than in
+/// the extractor because both the extractor and the generator have to agree
+/// about which knob turns which vein. Two implementations of a naming rule are
+/// two chances for `[worldgen.ores.overrides.diamond]` to name nothing.
+///
+/// `placed[i]` is the block states placement `i` puts down; order within it
+/// does not matter.
+///
+/// **`overlapping` is reported rather than assumed away.** Every pair of target
+/// sets being identical or disjoint is a property of 1.21.1, not of the format:
+/// a datapack could place copper and gold from one feature and merge two groups
+/// an operator thinks of as separate. The day that stops being true should be a
+/// line of output, not a surprise in somebody's world.
+pub fn group(placed: &[Vec<String>]) -> Grouping {
+    let mut parent: Vec<usize> = (0..placed.len()).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let mut owner: BTreeMap<&str, usize> = BTreeMap::new();
+    for (index, targets) in placed.iter().enumerate() {
+        for target in targets {
+            match owner.get(target.as_str()) {
+                Some(&other) => {
+                    let (a, b) = (find(&mut parent, index), find(&mut parent, other));
+                    if a != b {
+                        parent[a] = b;
+                    }
+                }
+                None => {
+                    owner.insert(target.as_str(), index);
+                }
+            }
+        }
+    }
+
+    let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for index in 0..placed.len() {
+        let root = find(&mut parent, index);
+        members.entry(root).or_default().push(index);
+    }
+
+    let mut overlapping = Vec::new();
+    let mut groups = Vec::new();
+    let mut of_placement = vec![None; placed.len()];
+    for indices in members.values() {
+        let first: BTreeSet<&String> = placed[indices[0]].iter().collect();
+        if indices
+            .iter()
+            .any(|&i| placed[i].iter().collect::<BTreeSet<_>>() != first)
+        {
+            overlapping.extend(indices.iter().copied());
+        }
+        let mut targets: Vec<String> = indices
+            .iter()
+            .flat_map(|&i| placed[i].iter().cloned())
+            .collect();
+        targets.sort();
+        targets.dedup();
+        if let Some(name) = group_name(&targets) {
+            groups.push(Group {
+                name: OreGroup::new(name),
+                targets,
+                placements: indices.clone(),
+            });
+        }
+    }
+    groups.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+    for (slot, group) in groups.iter().enumerate() {
+        for &index in &group.placements {
+            of_placement[index] = Some(slot);
+        }
+    }
+    overlapping.sort_unstable();
+    Grouping {
+        groups,
+        of_placement,
+        overlapping,
+    }
+}
+
+/// The group's name, from the block ids in it.
+///
+/// The longest run of `_`-separated segments every id ends with, or the longest
+/// run they all begin with when they end differently, with a trailing `ore` or
+/// `ores` dropped if anything survives it. `minecraft:` is elided because a
+/// bare resource location means `minecraft:` everywhere else.
+///
+/// `None` when nothing is left, or when the blocks come from several
+/// namespaces and there is no data-derived way to pick a winner. Both are
+/// reported by the caller rather than dropped.
+pub fn group_name(targets: &[String]) -> Option<String> {
+    let namespaces: BTreeSet<&str> = targets
+        .iter()
+        .map(|t| t.split_once(':').map_or("minecraft", |(ns, _)| ns))
+        .collect();
+    let bodies: Vec<Vec<&str>> = targets
+        .iter()
+        .map(|t| {
+            t.split_once(':')
+                .map_or(t.as_str(), |(_, body)| body)
+                .split('_')
+                .collect()
+        })
+        .collect();
+
+    let shortest = bodies.iter().map(Vec::len).min()?;
+    let common = |take: for<'a> fn(&'a [&'a str], usize) -> &'a [&'a str]| -> Vec<String> {
+        let mut best: Vec<String> = Vec::new();
+        for n in 1..=shortest {
+            let first = take(&bodies[0], n);
+            if bodies.iter().all(|b| take(b, n) == first) {
+                best = first.iter().map(|s| (*s).to_owned()).collect();
+            } else {
+                break;
+            }
+        }
+        best
+    };
+
+    let mut segments = common(|b, n| &b[b.len() - n..]);
+    if segments.is_empty() {
+        segments = common(|b, n| &b[..n]);
+    }
+    if segments.len() > 1 && matches!(segments.last().map(String::as_str), Some("ore" | "ores")) {
+        segments.pop();
+    }
+    if segments.is_empty() {
+        return None;
+    }
+
+    let body = segments.join("_");
+    match namespaces.iter().copied().collect::<Vec<_>>()[..] {
+        ["minecraft"] => Some(body),
+        [one] => Some(format!("{one}:{body}")),
+        _ => None,
     }
 }
 
@@ -549,14 +730,16 @@ mod tests {
 
     // What these tests do not catch, per the rule in `Testing.md`:
     //
-    // - Nothing here places a block. Every assertion is about the numbers handed
-    //   to the ore feature, and the feature that consumes them does not exist.
-    //   A `Resolved` that is right and a generator that ignores it would pass
-    //   every test above.
+    // - Nothing here places a block. Every assertion is about the numbers
+    //   handed to the ore feature, and a `Resolved` that is right with a
+    //   generator that ignored it would pass every test above. The feature that
+    //   consumes them exists now, and the tests that dig a chunk up and count
+    //   the cells live beside it in `crate::feature` — including the one that
+    //   proves the default path does not rewrite the chain at all.
     // - `extra_attempt_chance` is asserted as a probability, never as an
-    //   outcome. Whether the generator draws it from the chunk's own random
-    //   source — which is what makes a world reproducible from its seed — is a
-    //   property of the generator, and is untestable until there is one.
+    //   outcome. Whether it is drawn from the chunk's own decoration stream —
+    //   which is what makes a world reproducible from its seed — is a property
+    //   of `crate::feature::Modifier::Attempts` and is asserted there.
     // - The baselines *here* are invented, so nothing in this module's tests
     //   depends on vanilla's figures being right. The identity property is
     //   asserted against the extracted vanilla table as well, in
