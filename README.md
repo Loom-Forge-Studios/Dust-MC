@@ -265,6 +265,26 @@ right-click branch removed. Decision record
 [0034](docs/decisions/0034-how-a-crafting-table-opens.md) says why there is one
 set of rules and not two.
 
+**And a stonecutter cuts and a smithing table upgrades.** The 277 recipe files
+nothing could reach are 259 of them: 250 `stonecutting` and the nine
+`smithing_transform`. A stonecutter is the first screen here where **the client
+decides what the buttons mean** — it filters the recipe list by what is in the
+input slot, sorts the survivors, and sends back a *position in that list*, an
+order neither end puts on the wire. Get it wrong and a player presses "stairs"
+and is handed a wall, silently, with both sides believing they agree. So it was
+measured before it was built: `tools/bot/benches.js --survey` pressed all 24
+button ids on six inputs against a real 1.21.1 server, and the order is the
+result item's **description id** — not the recipe id and not the order the
+recipes arrive in. A smithing table's result is the **base stack transmuted**,
+so a diamond chestplate that was enchanted, named and half-worn comes out
+enchanted, named and half-worn in netherite; building it from the recipe's own
+item would have stripped every enchantment and passed any check that compared
+item ids. **17 of 17 rows agree with a real 1.21.1 server, with 2 declared
+divergences** — both of them the eighteen armour trims Dust declines, seen from
+two ends — and 0 of 17 when the wire layout is broken on purpose. Decision
+record [0037](docs/decisions/0037-the-two-benches-that-are-not-a-grid.md) has
+the button table and what it declined.
+
 And a fence connects to what it touches, whichever way the wall was built. A
 fence, a wall, a glass pane and a stair take their shape from the six cells
 around them — when they are placed, and again whenever anything beside them is
@@ -393,13 +413,14 @@ that caught a bare hand being the right tool for dirt;
 them left out on purpose rather than approximated because a five-fold error
 would break the very agreement that keeps a predicted block from coming back;
 **Q still destroys a stack rather than throwing it**, and item entities are not
-saved, so a restart clears the floor; **a crafting table stays open however far
-the player walks**, because the reach check runs when it opens and never
-again — which costs nobody an item, since the grid comes back to them
-whenever they close it; no **furnace, blast furnace,
-smoker, campfire, stonecutter or smithing table**, which is 389 of the 1,290
-recipe files an operator's data pack ships and is a different shape from a
-crafting grid — a furnace has a fuel slot and a burn timer, not a pattern; a
+saved, so a restart clears the floor; **a crafting table, a stonecutter and a
+smithing table all stay open however far the player walks**, because the reach
+check runs when the screen opens and never again — which costs nobody an item,
+since everything in them comes back whenever they close it; no **armour trim**,
+which is eighteen of the 1,290 recipe files an operator's data pack ships and
+the only family left that a bench here opens and cannot make — a trim's result
+is a `minecraft:trim` component the *server* has to author, and Dust carries
+the components that arrive rather than writing new ones; a
 stack carries its data components and a break now reads its
 **enchantments** — silk touch, fortune and efficiency all work, scored 27/27
 against a real 1.21.1 server and 15/27 with the component withheld — but
