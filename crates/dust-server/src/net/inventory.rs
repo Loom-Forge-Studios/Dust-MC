@@ -1425,7 +1425,7 @@ impl Inventory {
     /// Called only once the result has already been handed to the player, so
     /// there is no path on which the grid is spent and nothing comes back —
     /// which is the one failure crafting must not have. See decision record
-    /// 0031.
+    /// 0033.
     fn take_result(&mut self, window: Window, changed: &mut Changed) {
         // A bench has no grid and still has to be paid for. `StonecutterMenu`
         // removes one from the input and `SmithingMenu` one from each of the
