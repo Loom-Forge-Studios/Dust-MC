@@ -918,6 +918,14 @@ fn play_frames(out: &mut Vec<Frame>) {
         sb,
         Play,
         Serverbound,
+        sb::ChatCommand {
+            command: s("time set day"),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
         sb::CustomPayload {
             channel: id("dust:hello"),
             data: RestOfPacket(vec![1, 2, 3]),

@@ -52,6 +52,20 @@ max_catchup_ticks = 20
 # force. Raise it if a world this size needs longer to save.
 shutdown_timeout_secs = 10
 
+# Whether the sun moves. Minecraft's doDaylightCycle game rule, as a setting.
+#
+# On, a day takes twenty minutes and the world remembers where the sun was
+# across a restart — in Dust's own save, and in the world's level.dat when it
+# has one, so opening the world in Minecraft shows the same time of day. Off,
+# the sun stops where it was left, which is what a build server wants; the
+# world's age still counts up either way.
+#
+# Not a performance setting. A running clock costs two and a half nanoseconds a
+# tick and eighteen bytes per player per second, and turning it off saves
+# neither: the sun is kept as an offset from the world's age, so a stopped
+# cycle is the same single addition.
+daylight_cycle = true
+
 # Lowest severity logged: error, warn, info, debug or trace.
 log_level = "info"
 

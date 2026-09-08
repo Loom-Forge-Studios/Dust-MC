@@ -96,3 +96,7 @@ harness = false
 [[bench]]
 name = "updates"
 harness = false
+
+[[bench]]
+name = "daylight"
+harness = false

@@ -138,6 +138,28 @@ pub struct ServerConfig {
     #[config(restart)]
     pub game_mode: GameMode,
 
+    /// Whether the sun moves. Minecraft's `doDaylightCycle` game rule, as a
+    /// setting, because Dust has no game rules yet and this is the one a
+    /// server operator actually reaches for.
+    ///
+    /// On, the world's clock advances one tick per tick and a day takes twenty
+    /// minutes. Off, the clock stands where it was left and the client is told
+    /// so — the protocol carries that as a negative time of day, so the sun
+    /// stops rather than jittering between the packets that would otherwise
+    /// keep correcting it, and a build server stays lit all night.
+    ///
+    /// It does not stop *time*: the world's age still counts up, so anything
+    /// that measures elapsed ticks keeps measuring them. It is the sun that
+    /// stops, which is what an operator turning this off is asking for.
+    ///
+    /// This is not a performance setting and turning it off saves nothing
+    /// measurable: a running clock costs 2.5 nanoseconds a tick — the same as
+    /// a stopped one, which is one atomic addition either way — and eighteen
+    /// bytes per player per second, and a stopped cycle still sends the packet
+    /// so that a client which has drifted is corrected.
+    #[config(restart)]
+    pub daylight_cycle: bool,
+
     /// Path to a directory of `.mca` region files to serve, or empty to
     /// generate a flat world. A column the files do not contain is generated
     /// flat, because a world is a disc in an infinite plane and a player may
@@ -213,6 +235,11 @@ impl Default for ServerConfig {
             // is one box of at most eight block cells per movement packet, and
             // on a flat world that is an array index.
             movement_collision: true,
+            // On, because a world where the sun does not move is not the game
+            // — and because until this existed every Dust server was a
+            // permanent midday, which is the thing this setting's default is
+            // fixing rather than preserving.
+            daylight_cycle: true,
             log_level: LogLevel::default(),
             game_mode: GameMode::default(),
             world_source: String::new(),

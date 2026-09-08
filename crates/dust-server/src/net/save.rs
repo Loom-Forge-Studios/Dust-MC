@@ -159,6 +159,24 @@ pub struct SavedPlayer {
     pub experience: u32,
 }
 
+/// The world's clock, as it is written down.
+///
+/// **Ticks, and the same argument the furnace's ticks get one register up: a
+/// world does not age while the server is off.** A clock advanced over the
+/// downtime would mean logging in after a weekend to a random time of day —
+/// and, on a server people take turns hosting, to a *different* random time of
+/// day for each of them. Vanilla stores ticks and stops them with the process,
+/// and so does this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedTime {
+    /// Every tick this world has run. Vanilla's `Data.Time`.
+    pub game_time: u64,
+    /// The sun's position as a running total, not reduced into a day. Vanilla's
+    /// `Data.DayTime`, and see [`crate::net::daylight`] for why the total is
+    /// what is kept.
+    pub day_time: u64,
+}
+
 /// The whole file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Save {
@@ -173,6 +191,21 @@ pub struct Save {
     /// is a world from before furnaces existed and therefore had none.
     #[serde(default)]
     pub furnaces: Vec<SavedFurnace>,
+    /// Where the sun was. Absent in a file written before there was a clock
+    /// to write, which is a world that stood at noon for ever and has no time
+    /// of its own to come back to.
+    ///
+    /// **This is the record that wins on load.** A world served from region
+    /// files also has a `level.dat` with the same two numbers in it, and Dust
+    /// writes both at the same instant, so they agree — but only one of them
+    /// can be the answer when they do not, and it is this one: if the
+    /// `level.dat` write failed (a read-only world directory, a file an
+    /// operator has open in an editor) then it is the stale one, and a world
+    /// that jumped backwards on every restart would be the result of trusting
+    /// it. `level.dat` is read instead when there is no save here at all,
+    /// which is exactly the world imported from vanilla and never yet served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<SavedTime>,
     /// Which Minecraft version's component encoding the `components` fields
     /// are written in, or absent when no stack in the file has any.
     ///
@@ -209,6 +242,14 @@ pub struct Save {
 /// Bumped to 3 when furnaces joined the file, on the same argument: a version
 /// 2 file has no `furnaces` key, defaults to none, and that is exactly what a
 /// world written before there were any means.
+///
+/// **Not bumped to 4 when the clock joined it, and that is the interesting
+/// one.** Every earlier bump added a key whose absence had a correct meaning —
+/// no inventories, no furnaces — and so does this: a file with no `time` is a
+/// world from before Dust had a clock, which stood permanently at noon and
+/// therefore has no time of day worth restoring. It falls back to `level.dat`
+/// and then to dawn, which is what a world with no clock means. A bump would
+/// have made every existing save unreadable to say the same thing.
 pub const SAVE_VERSION: u32 = 3;
 
 /// The file's name inside the world directory.
@@ -686,10 +727,41 @@ mod tests {
     }
 
     #[test]
+    fn the_clock_survives_a_restart_and_an_old_save_has_none_to_survive() {
+        let dir = temp_dir("clock");
+        let mut save = Save {
+            version: SAVE_VERSION,
+            time: Some(SavedTime {
+                game_time: 1_234_567,
+                day_time: 3 * 24_000 + 13_000,
+            }),
+            ..Save::default()
+        };
+        store(&dir, &save).expect("writable");
+        assert_eq!(
+            load(&dir).expect("readable").expect("there").time,
+            save.time
+        );
+
+        // A file written before there was a clock. It does not fail to load
+        // and it does not come back at some invented hour: it comes back with
+        // no opinion, which is what a world that stood at noon for ever has.
+        save.time = None;
+        store(&dir, &save).expect("writable");
+        assert_eq!(load(&dir).expect("readable").expect("there").time, None);
+        let text = std::fs::read_to_string(path_in(&dir)).expect("readable");
+        assert!(
+            !text.contains("time"),
+            "a world with no clock writes no key for one: {text}"
+        );
+    }
+
+    #[test]
     fn what_is_written_is_what_comes_back() {
         let dir = temp_dir("roundtrip");
         let save = Save {
             version: SAVE_VERSION,
+            time: None,
             furnaces: Vec::new(),
             components: None,
             blocks: vec![SavedBlock {
@@ -780,6 +852,7 @@ mod tests {
         // changed version needs to know which item their players lost.
         let save = Save {
             version: SAVE_VERSION,
+            time: None,
             furnaces: Vec::new(),
             components: None,
             blocks: Vec::new(),
@@ -879,6 +952,7 @@ mod tests {
         let dir = temp_dir("atomic");
         let good = Save {
             version: SAVE_VERSION,
+            time: None,
             furnaces: Vec::new(),
             components: None,
             blocks: vec![SavedBlock {
@@ -914,6 +988,7 @@ mod tests {
     fn one_player(stack: SavedStack, components: Option<&str>) -> Save {
         Save {
             version: SAVE_VERSION,
+            time: None,
             furnaces: Vec::new(),
             components: components.map(ToOwned::to_owned),
             blocks: Vec::new(),
@@ -1046,6 +1121,7 @@ mod tests {
         let dir = temp_dir("plain");
         let save = Save {
             version: SAVE_VERSION,
+            time: None,
             furnaces: Vec::new(),
             components: None,
             blocks: Vec::new(),

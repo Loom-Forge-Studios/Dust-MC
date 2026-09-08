@@ -450,6 +450,9 @@ pub struct Server {
     /// inserted in the same two phases and for the same reason as the item
     /// physics beside it.
     world_ticker: Option<Box<dyn crate::participant::TickParticipant>>,
+    /// The world's clock. Same two phases again: it is restored from the save
+    /// the bind phase reads, and it only moves once there is a tick loop.
+    daylight_ticker: Option<Box<dyn crate::participant::TickParticipant>>,
 }
 
 /// What the teardown has to write out.
@@ -458,7 +461,13 @@ struct Saveable {
     positions: crate::net::save::SharedPositions,
     inventories: crate::net::save::SharedInventories,
     furnaces: std::sync::Arc<crate::net::furnaces::Furnaces>,
+    clock: std::sync::Arc<crate::net::daylight::WorldClock>,
     world_dir: PathBuf,
+    /// The region directory this server was pointed at, when it was pointed at
+    /// one. `level.dat` sits beside it, and the clock is written back into it
+    /// so that a world Dust served for a week opens in vanilla at the time it
+    /// was left rather than the time it was imported.
+    region_dir: Option<PathBuf>,
 }
 
 impl fmt::Debug for Server {
@@ -499,6 +508,7 @@ impl Server {
             item_ticker: None,
             furnace_ticker: None,
             world_ticker: None,
+            daylight_ticker: None,
         }
     }
 
@@ -593,6 +603,9 @@ impl Server {
             participants.insert(ticker);
         }
         if let Some(ticker) = self.furnace_ticker.take() {
+            participants.insert(ticker);
+        }
+        if let Some(ticker) = self.daylight_ticker.take() {
             participants.insert(ticker);
         }
         for extra in std::mem::take(&mut self.options.extra_tasks) {
@@ -766,6 +779,7 @@ impl Server {
         let reach = dust_guard::Reach::new(config.server.interaction_range);
         let speed = dust_guard::SpeedLimit::new(config.server.movement_speed_limit);
         let collision = config.server.movement_collision;
+        let daylight_cycle = config.server.daylight_cycle;
         let data_path = config.data.path.clone();
         let configured_seed = config.worldgen.seed;
 
@@ -1212,6 +1226,27 @@ impl Server {
         let positions: crate::net::save::SharedPositions = std::sync::Arc::default();
         let inventories: crate::net::save::SharedInventories = std::sync::Arc::default();
         let furnaces = std::sync::Arc::new(crate::net::furnaces::Furnaces::new());
+        // The region directory, when there is one. `level.dat` is beside it,
+        // and it is both where an imported world's clock is read from and
+        // where this server's clock is written back.
+        let region_dir = (!world_source.is_empty()).then(|| world_directory.clone());
+        // Where the sun is, before the save is read. Three sources in
+        // decreasing authority, and each one is a different world:
+        //
+        //  1. Dust's own save file — the record this server wrote last, and
+        //     the only one guaranteed to exist for every world it serves.
+        //  2. `level.dat` — a world imported from vanilla, or one whose Dust
+        //     save has been deleted. It is what makes a world dropped into
+        //     `world_source` open at the hour its owner left it.
+        //  3. Dawn on day zero, which is where Minecraft starts a new world.
+        //
+        // The order matters in exactly one case and it is worth stating: if
+        // the `level.dat` write at shutdown failed — a read-only directory, a
+        // file open in an editor — then it holds an older time than the save
+        // does, and a server that preferred it would walk the world backwards
+        // a little on every restart.
+        let mut clock_source = "a fresh world";
+        let mut restored_time = None;
         match crate::net::save::load(&world_dir) {
             Ok(Some(saved)) => {
                 let (blocks, unknown) = crate::net::save::resolve(&saved.blocks);
@@ -1302,10 +1337,48 @@ impl Server {
                         ),
                     );
                 }
+                if let Some(time) = saved.time {
+                    restored_time = Some((time.game_time, time.day_time));
+                    clock_source = "this server's own save";
+                }
             }
             Ok(None) => {}
             Err(e) => return Err(fail(format!("{e}"))),
         }
+        if restored_time.is_none() {
+            if let Some(time) = region_dir
+                .as_deref()
+                .and_then(crate::net::level::time_beside)
+            {
+                restored_time = Some((time.game_time, time.day_time));
+                clock_source = "the world's own level.dat";
+            }
+        }
+        let clock = std::sync::Arc::new(match restored_time {
+            Some((game_time, day_time)) => {
+                crate::net::daylight::WorldClock::new(game_time, day_time, daylight_cycle)
+            }
+            None => crate::net::daylight::WorldClock::fresh(daylight_cycle),
+        });
+        self.options.logger.info(
+            "dust::server",
+            format!(
+                "the world is on day {} at tick {} of it, from {clock_source}; the daylight \
+                 cycle is {}",
+                clock.day(),
+                clock.time_of_day(),
+                if daylight_cycle { "running" } else { "stopped" }
+            ),
+        );
+
+        // Built once at boot because it cannot change while the server runs,
+        // and because every joining player is sent the same bytes. A graph
+        // this server cannot build is a server that would tab-complete
+        // nothing, which is a boot failure rather than a surprise per join.
+        let commands = std::sync::Arc::new(
+            crate::net::commands::declaration()
+                .map_err(|e| fail(format!("the command graph could not be built: {e}")))?,
+        );
 
         // Minecraft's own registry contents, if the operator pointed at a
         // copy. Loaded before the listener binds rather than on first use: a
@@ -1392,6 +1465,8 @@ impl Server {
             cutting: std::sync::Arc::clone(&cutting),
             smithing: std::sync::Arc::clone(&smithing),
             furnaces: std::sync::Arc::clone(&furnaces),
+            clock: std::sync::Arc::clone(&clock),
+            commands: std::sync::Arc::clone(&commands),
             item_entity_type: crate::net::play::item_entity_type().ok_or_else(|| {
                 fail("the generated entity table has no minecraft:item".to_owned())
             })?,
@@ -1408,6 +1483,12 @@ impl Server {
             std::sync::Arc::clone(&world),
             Some(std::sync::Arc::clone(&cooking)),
             ctx.item_blocks.clone(),
+        )));
+        // One addition per tick, and it is a participant of its own so that the
+        // clock cannot stop because something else in the tick did. See
+        // `net::daylight` for what it costs, which is a nanosecond.
+        self.daylight_ticker = Some(Box::new(crate::net::daylight::DaylightTicker::new(
+            std::sync::Arc::clone(&clock),
         )));
         self.item_ticker = Some(Box::new(crate::net::items::ItemTicker::new(
             std::sync::Arc::clone(&items),
@@ -1464,7 +1545,9 @@ impl Server {
             positions: std::sync::Arc::clone(&positions),
             inventories: std::sync::Arc::clone(&inventories),
             furnaces: std::sync::Arc::clone(&furnaces),
+            clock: std::sync::Arc::clone(&clock),
             world_dir,
+            region_dir,
         });
         Ok(())
     }
@@ -1629,13 +1712,46 @@ impl Server {
 
         let stacks: usize = players.iter().map(|p| p.inventory.len()).sum();
         let burning = furnaces.iter().filter(|f| f.lit > 0).count();
+        // Read once, here, and written to both places from the one reading, so
+        // that the save file and `level.dat` cannot disagree by a tick.
+        let time = crate::net::save::SavedTime {
+            game_time: saveable.clock.game_time(),
+            day_time: saveable.clock.day_time(),
+        };
         let counts = format!(
-            "{} block change(s), {} player position(s), {stacks} carried stack(s) and \
-             {} furnace(s), {burning} of them alight",
+            "{} block change(s), {} player position(s), {stacks} carried stack(s), \
+             {} furnace(s), {burning} of them alight, and the clock on day {} at tick {}",
             blocks.len(),
             players.len(),
-            furnaces.len()
+            furnaces.len(),
+            time.day_time / crate::net::daylight::DAY_TICKS,
+            time.day_time % crate::net::daylight::DAY_TICKS
         );
+        // Into the world's own file as well, when there is one. Best effort by
+        // design: the clock is already in the save above, so a `level.dat`
+        // that could not be rewritten costs an operator the time of day *in
+        // vanilla* and costs this server nothing. Failing a shutdown over it
+        // would be the wrong trade — it would leave the block edits unwritten
+        // too.
+        if let Some(region_dir) = saveable.region_dir.as_deref() {
+            match crate::net::level::store_time_beside(
+                region_dir,
+                crate::net::level::WorldTime {
+                    game_time: time.game_time,
+                    day_time: time.day_time,
+                },
+            ) {
+                Ok(true) | Ok(false) => {}
+                Err(e) => self.options.logger.warn(
+                    "dust::server",
+                    format!(
+                        "the world's own level.dat could not be given the time back ({e}); \
+                         this server will still restore it from its own save, but opening \
+                         the world in Minecraft will show the time it was imported at"
+                    ),
+                ),
+            }
+        }
         let save = crate::net::save::Save {
             version: crate::net::save::SAVE_VERSION,
             blocks,
@@ -1643,6 +1759,7 @@ impl Server {
                 .map(std::borrow::ToOwned::to_owned),
             players,
             furnaces,
+            time: Some(time),
         };
         match crate::net::save::store(&saveable.world_dir, &save) {
             Ok(()) => format!("saved {counts}"),

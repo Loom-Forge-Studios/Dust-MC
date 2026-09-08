@@ -270,20 +270,22 @@ fn boot_ticks_simulated_ctrl_c_and_shutdown_follow_the_documented_order() {
     // Configuration reached the registry: the two config-gated placeholders
     // and the injected participant all ran, in priority order.
     //
-    // `updates`, `items` and `furnaces` are between the probe and the counter
-    // and none of them is a placeholder — they are the world reacting to being
-    // changed, the item entities' physics and the furnaces' burn timers, and
-    // they are the only real work the tick loop has been given. A tick that
-    // reported the list without them would be one where nothing dropped on the
-    // ground ever moved, no sand ever fell and nothing ever smelted, which is
-    // why the list is spelled out here rather than counted. **The order is
-    // asserted and not just the membership**: a block that breaks this tick has
-    // to be broken before the items pass runs, or its drops sit still for a
-    // tick before they pop.
+    // `daylight`, `updates`, `items` and `furnaces` are between the probe and
+    // the counter and none of them is a placeholder — they are the world's
+    // clock, the world reacting to being changed, the item entities' physics
+    // and the furnaces' burn timers, and they are the only real work the tick
+    // loop has been given. A tick that reported the list without them would be
+    // one where the sun never moved, nothing dropped on the ground ever moved,
+    // no sand ever fell and nothing ever smelted, which is why the list is
+    // spelled out here rather than counted. **The order is asserted and not
+    // just the membership**: the clock moves before anything that could read
+    // it, and a block that breaks this tick has to be broken before the items
+    // pass runs, or its drops sit still for a tick before they pop.
     assert_eq!(
         report.participants,
         vec![
             "status-probe",
+            "daylight",
             "updates",
             "items",
             "furnaces",

@@ -555,11 +555,10 @@ fn the_unclaimed_worklist_is_exactly_the_blocked_set() {
         // The chat-signing wall: offline-first means no session keys, and
         // these packets exist to carry them. See `play::chat`.
         (State::Play, Direction::Clientbound, "minecraft:delete_chat"),
-        (
-            State::Play,
-            Direction::Serverbound,
-            "minecraft:chat_command",
-        ),
+        // `minecraft:chat_command` used to be here and is now defined: 1.20.5
+        // split the signing artifacts out into the packet below and left it a
+        // bare string. See `play::mod`'s header for why that was a mistake in
+        // the reasoning rather than a change of mind about signing.
         (
             State::Play,
             Direction::Serverbound,
