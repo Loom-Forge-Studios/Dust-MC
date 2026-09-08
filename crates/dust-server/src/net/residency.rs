@@ -382,7 +382,7 @@ impl Residency {
 
     /// The columns in the ring around `centre` that are held and not yet built.
     ///
-    /// The list a warming thread works through. Taken as a snapshot under the
+    /// The list a builder works through. Taken as a snapshot under the
     /// read lock and then let go of, because building them is the part that
     /// takes a couple of milliseconds each and no lock may be held across it.
     #[must_use]
@@ -570,7 +570,7 @@ pub struct ColumnClaim {
     residency: Option<Arc<Residency>>,
     /// Where a newly claimed column goes to be built, off this thread. See
     /// [`super::source::Source::want`].
-    warm: Option<std::sync::mpsc::Sender<Vec<ChunkPos>>>,
+    warm: Option<super::source::Warming>,
     held: Vec<ChunkPos>,
 }
 
@@ -584,10 +584,7 @@ impl std::fmt::Debug for ColumnClaim {
 
 impl ColumnClaim {
     #[must_use]
-    pub fn new(
-        residency: Option<Arc<Residency>>,
-        warm: Option<std::sync::mpsc::Sender<Vec<ChunkPos>>>,
-    ) -> Self {
+    pub fn new(residency: Option<Arc<Residency>>, warm: Option<super::source::Warming>) -> Self {
         Self {
             residency,
             warm,
@@ -628,9 +625,9 @@ impl ColumnClaim {
         self.held.extend_from_slice(wanted);
         if !added.is_empty() {
             if let Some(warm) = &self.warm {
-                // Fails only while the world is being dropped, and there is
-                // nothing to warm for a world that is going away.
-                let _ = warm.send(added);
+                // A closed queue takes nothing, and there is nothing to warm
+                // for a world that is going away.
+                warm.send(added);
             }
         }
     }

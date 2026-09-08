@@ -396,7 +396,7 @@ impl EditedWorld {
     /// Ask for claimed columns to be built and carry on, without waiting.
     ///
     /// The call every hot path wants: it hands the list to the world's own
-    /// warming thread. Safe from a session task and from the tick loop alike,
+    /// pool of builders. Safe from a session task and from the tick loop alike,
     /// which is the point of it — those are different threads with different
     /// rules and neither may read a region file.
     pub fn want(&self, columns: Vec<ChunkPos>) {
@@ -440,7 +440,7 @@ impl EditedWorld {
 
     /// See [`super::source::Source::warming`].
     #[must_use]
-    pub fn warming(&self) -> Option<std::sync::mpsc::Sender<Vec<ChunkPos>>> {
+    pub fn warming(&self) -> Option<super::source::Warming> {
         self.generated.warming()
     }
 

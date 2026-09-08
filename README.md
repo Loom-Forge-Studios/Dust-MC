@@ -52,6 +52,21 @@ own tokio worker and out of everybody else's way. Four bots joining at once
 were sent 273 to 279 of their 289 columns in the same three seconds where they
 used to get 181 to 253, finishing within 20 ms of each other rather than
 staggered across 400, because the store builds their columns once between them.
+
+**The world is built by a pool of builders and not by one thread** — half the
+machine's parallelism, capped at four. A cold join into generated terrain took
+its last column at 2,699 ms with one builder and takes it at 1,069 with four,
+which is 108 ms off the same stream against a world with nothing left to build;
+four people joining at once went from 17,202 ms to 5,584; and the 20 ms stream
+passes that had a window and nothing built to send dropped from 273 to 19 on a
+single join. Sizing
+it also found a defect that had nothing to do with threads until threads
+arrived: **a generated column's light depended on the order its neighbours had
+been built in**, on 15 of 900 columns, because one cache key held two different
+functions' answers. Decision record
+[0036](docs/decisions/0036-how-many-threads-build-the-world.md) has the ladder,
+the cap, and that.
+
 Decision record [0031](docs/decisions/0031-how-a-join-streams-its-chunks.md) has
 the ladder that says which world each number is about, and
 [0042](docs/decisions/0042-what-a-joining-crowd-costs-a-bystander.md) retracts
@@ -364,16 +379,17 @@ so water and lava sit where they are put and a bucket does nothing at all,
 which is the largest thing left and is decision record
 [0040](docs/decisions/0040-what-a-changed-cell-tells-its-neighbours.md)'s
 named next step; **no player physics**, so a player is stopped from
-entering a block and never pushed out of one; **only one thread builds columns
-for a world**, so a cold join into generated terrain is about 3.3 seconds of
-world arriving around a player who is already walking — the loading screen ends
-at 242 ms, and records
-[0031](docs/decisions/0031-how-a-join-streams-its-chunks.md) and
-[0038](docs/decisions/0038-how-wide-the-region-lock-is.md) say what a pool would
-move and why it is declined —
-[0042](docs/decisions/0042-what-a-joining-crowd-costs-a-bystander.md) declines
-it a third time, because the stall it was for turned out to be the harness and
-a bystander measured from her own process waits 7 ms while four people join;
+entering a block and never pushed out of one; **a join is still not at the
+pacing floor its stream was designed around**, so a cold join into generated
+terrain is 1,069 ms of world arriving around a player who is already walking,
+against the 961 ms the same stream takes on a world with nothing left to
+build — records [0031](docs/decisions/0031-how-a-join-streams-its-chunks.md),
+[0038](docs/decisions/0038-how-wide-the-region-lock-is.md) and
+[0042](docs/decisions/0042-what-a-joining-crowd-costs-a-bystander.md) declined a
+pool of builders three times over, and
+[0036](docs/decisions/0036-how-many-threads-build-the-world.md) says what it was
+worth when it was finally measured, why it stops at four builders when eight are
+faster, and what still separates the two;
 **no water on the movement path**,
 so a player who says they are sprinting and airborne is measured at their feet
 rather than at their full height, because they might be swimming and no client

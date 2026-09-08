@@ -676,9 +676,9 @@ where
     if ctx.world.residency().is_some() {
         let world = std::sync::Arc::clone(&ctx.world);
         // A blocking task that could not be spawned leaves the columns to the
-        // world's own warming thread, which already has them: the claim above
-        // asked for them. The stream then paces itself against that thread
-        // instead, which is slower and not wrong.
+        // world's own builders, which already have them: the claim above asked
+        // for them. The stream then paces itself against the pool instead,
+        // which is slower and not wrong.
         let _ = tokio::task::spawn_blocking(move || world.warm_columns(&first)).await;
     }
 
@@ -868,7 +868,7 @@ where
 ///    corner is the difference between walking and waiting.
 /// 2. **A claim on a bounded window ahead of the send point.** The columns
 ///    this pass is about to send, plus [`STREAM_AHEAD`] more, are held in the
-///    server's one column store and handed to its warming thread. Held, so
+///    server's one column store and handed to its builders. Held, so
 ///    that a column built for this session is *kept* — a second player joining
 ///    beside the first finds them there. Bounded, so a stream never pins a
 ///    view's worth of world.

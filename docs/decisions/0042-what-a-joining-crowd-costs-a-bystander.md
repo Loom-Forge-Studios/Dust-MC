@@ -124,6 +124,14 @@ ends the question rather than deferring it: the stall it was meant to fix does
 not exist. It should be reconsidered only if something a player can feel is
 measured first.
 
+**Built by [D36](0036-how-many-threads-build-the-world.md), 2026-09-07**, and
+this paragraph's condition is what built it. The stall this record retracted was
+a bystander's and it did not exist. The thing a player can feel is the *joiner's
+own* wait for the ground, which no instrument in D31, D38 or here ever timed —
+three records argued about a pool while measuring somebody standing still.
+Measured, a cold generated join is 2,699 ms of world arriving with one builder
+and 1,069 with four, against a pacing floor of 740.
+
 **Deleting the `same` mode.** It is the only way to reproduce what D31 and D38
 published, and a record that says "the old number was the instrument" is worth
 much less if the old number can no longer be produced.
