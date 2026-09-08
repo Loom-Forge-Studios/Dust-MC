@@ -54,6 +54,11 @@ build:
 # It is still the first thing to run after any protocol change. mineflayer
 # shares no code with this project, which is why it finds what the test suite
 # agrees with itself about. See tools/bot/README.md.
+#
+# **Run it against a generated world as well as a flat one, from a release
+# build.** A `[data] path` with no `dust-biomes.tsv` in it serves flat terrain
+# whatever `[worldgen] seed` says, and this was green on one of those while it
+# was 22 of 29 on an ocean spawn. Decision record 0045 is the account.
 bot port="25565":
     cd tools/bot && node check.js {{port}}
 
