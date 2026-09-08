@@ -486,6 +486,13 @@ Then add `localhost` to a 1.21.1 client's server list. Set `online_mode = false`
 in `dust.toml` first unless you want Mojang consulted, and point
 `world_source` at a `region` directory if you have a world to serve.
 
+That run leaves a `world/` directory beside wherever you started it, holding
+`dust-edits.json`: the blocks players broke, where they stood, what the furnaces
+were smelting and the world clock, written when the server stops and read back
+when it starts. It is Dust's own save, not `world_source` — a generated world
+with no source at all writes one too — so running from a checkout leaves one in
+the checkout, which is why `.gitignore` names it.
+
 For light, block sounds, placing what you are holding and getting the right
 thing out of what you break, put Minecraft's own answers beside your data:
 

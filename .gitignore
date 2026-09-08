@@ -9,3 +9,18 @@ wip/
 # the protocol conformance test and the differential harness speak to. See
 # crates/dust-protocol/tests/vanilla_conformance.rs.
 .dust-vanilla/
+# Dust's own run directory: `DEFAULT_WORLD_DIR`, relative to whatever directory
+# the binary was started in. It holds `dust-edits.json` — the blocks players
+# broke, where they stood, what the furnaces were smelting, and the world
+# clock — written in the world-dirs teardown of every clean run. It is not
+# `[server] world_source`, which is read-only region files an operator points
+# at: the save is written whether or not one is set, and a flat run with no
+# source at all leaves 129 bytes that put the clock back where it was on the
+# next boot. Run state, not a build artifact, and none of it reproducible from
+# what is committed here.
+#
+# Unanchored, because the working directory is the operator's and not this
+# repository's. README's `cargo run -p dust-server -- server` leaves one at the
+# root; `cargo run` from inside the crate left the one that reached commit
+# ecbc1014 and sat in the tree two save-format versions stale.
+world/
