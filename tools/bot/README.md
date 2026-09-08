@@ -13,6 +13,25 @@ wrote it. Since then it has found a missing `set_health` (and the fact that
 *where* that packet sits in the join burst is load-bearing), and it is what a
 `player_command` decoder one VarInt short was caught failing.
 
+## Run it against both worlds
+
+**A world with no `dust-biomes.tsv` beside its `[data] path` is a flat world**,
+whatever `[worldgen] seed` says, and a flat world provides ground everywhere for
+free. `check.js` was green on one of those for a long time and 22 of 29 the
+first time anybody pointed it at generated terrain — seven checks that need a
+solid cell under the actor's feet, on a spawn that is sixty-three blocks of
+open ocean. It now **builds the floor it needs** rather than hoping the world
+provided one, and says so as a check of its own; decision record 0045 is the
+account, including the two separate things that go wrong over water.
+
+So run it twice, and use a **release** build: against a real world a debug
+binary fails checks a release binary passes, on the same commit.
+
+```
+just bot 25611     # a flat world:  no dust-biomes.tsv under [data] path
+just bot 25612     # generated:     dust-biomes.tsv there, [worldgen] seed = 1
+```
+
 ## The movement recorder
 
 `movement.js` is the same idea pointed at a different question. Rather than

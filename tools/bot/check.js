@@ -46,6 +46,142 @@ function spawned (username) {
 
 const wait = ms => new Promise(r => setTimeout(r, ms))
 
+// Every column the terrain-dependent checks below work in, as an offset in x
+// from where the actor stands. They are named and gathered here because
+// `buildGround` floors exactly this list: a check that wants a new column adds
+// it here and is given ground with it, rather than finding out on an ocean
+// spawn that it never had any.
+const STAIR = -2
+const DUG = 1
+const COBBLE = 2
+const SEEDS = 4
+const SOLID_FACE = 6
+const COLUMNS = [STAIR, DUG, COBBLE, SEEDS, SOLID_FACE]
+
+// How long to keep trying to get the actor onto something solid, and how long
+// to let it fall between tries. Eight tries at 700 ms covers a bot that
+// arrives falling; over open water it needs one.
+const FOOTHOLD_TRIES = 8
+const FOOTHOLD_MS = 700
+
+// Every block-changing packet in a session carries a rising sequence number,
+// so it is one counter for the whole run rather than one per section.
+let sequence = 1
+
+// Whether a cell holds something a player could stand on and place against.
+// `boundingBox` is mineflayer's own reading of the block, so water and tall
+// grass — the two things an unbuilt working area is made of — answer 'empty'
+// exactly as air does.
+const solid = block => Boolean(block) && block.boundingBox === 'block'
+
+// Put a block *into* `at`, by right-clicking that cell itself.
+//
+// A right-click on a replaceable cell — air, water, tall grass — puts the
+// block where the cell was rather than on the face that was clicked, which is
+// the one placement that needs no solid block to aim at. It is what makes a
+// floor buildable over open water at all. On a cell that is already solid it
+// would land one higher, so every caller here checks first.
+function fill (actor, at) {
+  actor._client.write('block_place', {
+    hand: 0,
+    location: { x: at.x, y: at.y, z: at.z },
+    direction: 1,
+    cursorX: 0.5,
+    cursorY: 1.0,
+    cursorZ: 0.5,
+    insideBlock: false,
+    sequence: sequence++
+  })
+}
+
+// The ground these checks stand on, built rather than looked for, and where
+// the actor ends up standing on it.
+//
+// Seven of the twenty-nine checks below need a solid cell under the actor's
+// feet: the one it digs out and fills back in, the three it places against,
+// and the one whose underside it clicks. On a flat world the world provides
+// them. On a generated world whose spawn is over ocean — `[worldgen] seed = 1`
+// is one — every one of those cells is water, and two separate things go
+// wrong. A right-click into water *replaces the water*, correctly, so the
+// block lands a cell below where the check looks for it; and the actor, with
+// nothing to stand on, sinks about half a block a second, so by the twentieth
+// second the far end of the working area is outside its six-block reach.
+// Twenty-two of twenty-nine, every run, for those two reasons and no other.
+//
+// This is the same resolution the "block this check needs is where it was put"
+// check already reached, applied to the floor instead of to one block: a check
+// that needs an arrangement of blocks builds it rather than hoping to find it.
+//
+// The foothold comes first and on its own. Until the actor has landed there is
+// no fixed position to measure the rest of the working area from, and every
+// cell it could aim at is moving away from it while it falls.
+async function buildGround (actor, watcher) {
+  const cobble = actor.registry.itemsByName.cobblestone
+  // 36 is hotbar slot 0, in vanilla's own container numbering.
+  actor._client.write('set_creative_slot', {
+    slot: 36,
+    item: {
+      itemCount: 1,
+      itemId: cobble.id,
+      addedComponentCount: 0,
+      removedComponentCount: 0,
+      components: [],
+      removeComponents: []
+    }
+  })
+  actor._client.write('held_item_slot', { slotId: 0 })
+  await wait(500)
+
+  for (let tries = 0; tries < FOOTHOLD_TRIES; tries++) {
+    const under = actor.entity.position.offset(0, -1, 0).floored()
+    if (solid(actor.blockAt(under))) break
+    fill(actor, under)
+    await wait(FOOTHOLD_MS)
+  }
+
+  // Where it came to rest, which is `stood` for everything below. Read after
+  // the fall rather than during it: a neighbour measured from a position the
+  // actor is still moving through is a neighbour of somewhere else.
+  let stood = actor.entity.position.clone()
+  for (let tries = 0; tries < 10; tries++) {
+    await wait(400)
+    const now = actor.entity.position
+    const settled = Math.abs(now.y - stood.y) < 0.01
+    stood = now.clone()
+    if (settled) break
+  }
+
+  // The floor, and one cell of support under the one the actor digs out — the
+  // hole is filled back in by clicking the top face of the block below it, and
+  // over water there is no block below it.
+  const level = stood.offset(0, -1, 0).floored()
+  const cells = COLUMNS.map(dx => level.offset(dx, 0, 0))
+  cells.push(level.offset(DUG, -1, 0))
+  for (const at of cells) {
+    if (solid(actor.blockAt(at))) continue
+    fill(actor, at)
+    await wait(300)
+  }
+  await wait(SETTLE_MS)
+
+  // Read back from the *other* player, and named rather than skipped. A gate
+  // that cannot set itself up has to say so: without this row the seven checks
+  // that need this floor would go red with seven different-looking reasons and
+  // none of them the real one.
+  const missing = cells.filter(at => !solid(watcher.blockAt(at)))
+  check(
+    'the ground these checks stand on was built',
+    missing.length === 0,
+    missing.length === 0
+      ? `${cells.length} cells at y=${level.y}, standing at ${stood.y}`
+      : missing
+        .map(at => `${at.x}/${at.y}/${at.z} is ` +
+          `${watcher.blockAt(at) ? watcher.blockAt(at).name : 'unknown'}`)
+        .join(', ')
+  )
+  return stood
+}
+
 // The two packets a client uses to write its own container, written by hand
 // because that is the point: prismarine builds them from its own reading of
 // the protocol and Dust decodes them with its own.
@@ -141,14 +277,15 @@ async function main () {
 
   const actor = await spawned('Actor')
   await wait(500)
-  // Where it stands *before* it digs: it is about to break the block under its
-  // own feet and fall, and a neighbour taken from the position afterwards is
-  // taken from somewhere else.
-  const stood = actor.entity.position.clone()
   actor.swingArm('right')
   await wait(500)
   actor.setControlState('sneak', true)
   await wait(500)
+
+  // The floor every check below stands on, and where the actor stands on it.
+  // Built first, because on an ocean spawn there is nothing there to measure
+  // from and nothing to hold the actor still while it is measured.
+  const stood = await buildGround(actor, watcher)
 
   // Breaking a block **beside** the actor rather than under it. `dig` waits
   // for the server to confirm; the server answers a start-digging as a
@@ -161,7 +298,7 @@ async function main () {
   // world the actor is at bedrock and half these checks are reading terrain
   // that is not there any more. The hole is filled back in below, which makes
   // the whole run leave the world as it found it.
-  const target = actor.blockAt(stood.offset(1, -1, 0))
+  const target = actor.blockAt(stood.offset(DUG, -1, 0))
   if (target) {
     try { await actor.dig(target) } catch (e) { /* the effect is the check */ }
   }
@@ -178,8 +315,8 @@ async function main () {
   // wrong — they place `minecraft:wheat`, and `minecraft:wheat` the *item* is
   // what bread is made of and places nothing at all.
   const held = [
-    { item: 'cobblestone', block: 'cobblestone', sound: 'block.stone.place', at: 2 },
-    { item: 'wheat_seeds', block: 'wheat', sound: 'item.crop.plant', at: 4 }
+    { item: 'cobblestone', block: 'cobblestone', sound: 'block.stone.place', at: COBBLE },
+    { item: 'wheat_seeds', block: 'wheat', sound: 'item.crop.plant', at: SEEDS }
   ]
   for (const [slot, what] of held.entries()) {
     const id = actor.registry.itemsByName[what.item]
@@ -206,7 +343,6 @@ async function main () {
   // across a restart — and a placement into a cell that already holds that
   // block is correctly silent, so a stale world would fail the sound check for
   // the right reason at the wrong time.
-  let sequence = 1
   for (const [slot, what] of held.entries()) {
     const on = actor.blockAt(stood.offset(what.at, -1, 0))
     if (!on) continue
@@ -365,7 +501,7 @@ async function main () {
     actor._client.write('held_item_slot', { slotId: 2 })
     await actor.look(Math.PI / 2, 0, true)
     await wait(400)
-    const on = actor.blockAt(stood.offset(-2, -1, 0))
+    const on = actor.blockAt(stood.offset(STAIR, -1, 0))
     if (on) {
       const at = on.position.offset(0, 1, 0)
       actor._client.write('block_dig', {
@@ -443,7 +579,10 @@ async function main () {
   // one run is open air on the tenth and the check passes without testing
   // anything. So: put a block on the floor, then click its underside, whose
   // far side is the floor.
-  const floor = actor.blockAt(stood.offset(6, -1, 0))
+  //
+  // The floor itself is now built too, by `buildGround` — over water there was
+  // none, and the block meant to go on top of it went into the water instead.
+  const floor = actor.blockAt(stood.offset(SOLID_FACE, -1, 0))
   let refused = null
   if (floor) {
     actor._client.write('held_item_slot', { slotId: 0 })
