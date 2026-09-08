@@ -129,6 +129,7 @@ fn main() {
             0,
             64,
             Some(Arc::clone(&constants)),
+            &dust_config::ore::OresConfig::default(),
         ) {
             Ok(Some((world, _))) => Some(EditedWorld::new(Source::Generated(Box::new(
                 GeneratedColumns::with_builders(world, builders),
