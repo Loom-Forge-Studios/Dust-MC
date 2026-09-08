@@ -3,17 +3,18 @@
 //!
 //! # What Dust generates today
 //!
-//! A superflat. Bedrock at the world's floor, three rows of dirt, one of grass
-//! at y -60, air above, `minecraft:plains` everywhere, and every column of
-//! every chunk identical — `dust_server::net::world::FlatWorld`, which says so
-//! in its own module note. A world read off disk falls back to it column by
-//! column, because a world is a disc in an infinite plane and a player can
-//! walk off the edge of it.
+//! Terrain, biomes, surface rules, aquifers, carvers and ore — six of vanilla's
+//! own stages, in vanilla's own order, out of the operator's own data pack.
+//! What is missing is the rest of the features: trees, plants, and everything a
+//! structure builds. A column no world file covers still falls back to
+//! `dust_server::net::world::FlatWorld`'s superflat, because a world is a disc
+//! in an infinite plane and a player can walk off the edge of it.
 //!
-//! This verb does not fix that. It measures it, before a line of noise is
-//! written, for the same reason `harness light` measured opacity before
-//! anything was changed: the number decides the order of the work, and three
-//! times on this project the number has disagreed with the intuition.
+//! This verb wrote none of that. It measured the gap before a line of noise
+//! existed and has measured every stage since, for the same reason
+//! `harness light` measured opacity before anything was changed: the number
+//! decides the order of the work, and three times on this project the number
+//! has disagreed with the intuition.
 //!
 //! # Counts, and five of them
 //!
@@ -40,31 +41,36 @@
 //!
 //! # The ladder
 //!
-//! Seven models over the same chunks in one run, each row the one above it
+//! Twelve models over the same chunks in one run, each row the one above it
 //! plus a single named change, in the order vanilla's own pipeline runs:
 //!
 //! ```text
-//!   0  the flat world Dust serves today
-//!   1  + the world's own sea level
-//!   2  + Dust's biome source                    the multi-noise climate
-//!   3  + Minecraft's surface height             the density functions
-//!   4  + Minecraft's carvers                    caves
-//!   5  + Minecraft's blocks at and below it     surface rules, ores, trees
-//!   6  + Minecraft's blocks above it            plants -- the control
+//!    0  the flat world Dust serves today
+//!    1  + the world's own sea level
+//!    2  + Dust's biome source                    the multi-noise climate
+//!    3  + Dust's terrain                         the density functions
+//!    4  + Dust's surface rules                   the block underfoot
+//!    5  + Dust's aquifers                        whether a cave drowns you
+//!    6  + Dust's carvers                         the caves themselves
+//!    7  + Dust's features                        ore, and the stone in it
+//!    8  + Minecraft's surface height             the ceiling above it
+//!    9  + Minecraft's carvers                    caves
+//!   10  + Minecraft's blocks at and below it     surface rules, ores, trees
+//!   11  + Minecraft's blocks above it            plants -- the control
 //! ```
 //!
-//! Rows 3 to 6 read their answer out of the region file. **None of them is a
+//! Rows 8 to 11 read their answer out of the region file. **None of them is a
 //! mode a server could run in** — that is the whole point of them, and it is
 //! the same device `harness light`'s last rung uses. What each row *buys* is
 //! what that stage of worldgen is worth, in cells, on this world.
 //!
-//! Row 2 used to be one of them and is not any more. It is Dust's own
-//! multi-noise biome source now, so it is a mode a server *could* run in, and
-//! the gap between it and row 3 — which hands Minecraft's biomes over — is
-//! what the biome source still gets wrong. That is how a stage graduates: the
-//! rung that stood in for it becomes the ceiling above it.
+//! Rows 2 to 7 were all ceilings once. Each became a candidate the day the
+//! stage under it was written, and that is how a stage graduates: the rung that
+//! stood in for it becomes the ceiling above it, and the gap between them is
+//! what the new stage still gets wrong. Row 7 is the newest and is the last one
+//! a server could run in.
 //!
-//! **Row 6 is a control and has to be exact.** It hands every block and every
+//! **Row 11 is a control and has to be exact.** It hands every block and every
 //! biome over, so anything short of 100% on all five scores is the scorer
 //! lying rather than the generator failing. It is checked in CI against
 //! synthetic chunks, in both directions: the control agrees, and a single
@@ -609,11 +615,26 @@ fn generator(
     match generator.features() {
         Some(features) => {
             let (running, read) = features.coverage();
+            let groups = features.ore_groups();
             println!(
-                "features: {running} of {read} placed feature(s) run, {} block(s) added to the \
-                 palette, from {}",
+                "features: {running} of {read} placed feature(s) run over {} ore group(s), \
+                 {} block(s) added to the palette, from {}",
+                groups.len(),
                 features.palette().len(),
                 data.join("minecraft/worldgen/placed_feature").display()
+            );
+            // The knobs `[worldgen.ores]` turns, named by the blocks the
+            // placements put down. This verb runs them unscaled — it is scored
+            // against Minecraft, and Minecraft is the identity setting — so the
+            // list is here to say which names an operator may write rather than
+            // to say what was applied.
+            println!(
+                "  ore group(s): {}",
+                groups
+                    .iter()
+                    .map(dust_config::ore::OreGroup::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             if !features.ocean_floor_bound() {
                 println!(
